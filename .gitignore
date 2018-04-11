@@ -1,0 +1,7 @@
+*.txt
+*.swp
+*__pycache__
+train_log
+input_images*
+VOC2012
+inception-v3
