@@ -47,17 +47,15 @@ import cv2
 import json
 import uuid
 try:
-    from .common import cfg
+    from .cfgs.config import cfg
 except Exception:
-    from common import cfg
+    from cfgs.config import cfg
 
 from tensorpack import *
 from preprocess_utils import *
 
 
 SAVE_DIR = 'input_images'
-TRAIN_IMG_DIR = 'VOC2012/JPEGImages'
-TRAIN_LABEL_DIR = 'VOC2012/SegmentationClassRaw'
 
 class Data(RNGDataFlow):
     def __init__(self,
@@ -87,26 +85,24 @@ class Data(RNGDataFlow):
             with open(filename) as f:
                 content.extend(f.readlines())
 
-        self.imglist = [x.strip() for x in content] 
+        self.img_list = [x.split(' ')[0] for x in content] 
+        self.label_list = [x.split(' ')[1] for x in content] 
         self.shuffle = shuffle
         self.flip = flip
         self.random_crop = random_crop
         self.random_expand = random_expand
 
     def size(self):
-        return len(self.imglist)
+        return len(self.img_list)
 
     def generate_sample(self, idx):
 
         # hflip = False if self.flip == False else (random.random() > 0.5)
-        line = self.imglist[idx]
-        train_image_filename = os.path.join(
-            TRAIN_IMG_DIR + '/' + line + '.' + self._image_format)
-        train_label_filename = os.path.join(
-            TRAIN_LABEL_DIR + '/' + line + '.' + self._label_format)
+        img_path = self.img_list[idx].strip()
+        label_path = self.label_list[idx].strip()
 
-        image = cv2.imread(train_image_filename)
-        label = cv2.imread(train_label_filename, cv2.IMREAD_GRAYSCALE)
+        image = cv2.imread(img_path)
+        label = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
   
         # s = image.shape
         # h, w, c = image.shape
@@ -139,8 +135,8 @@ class Data(RNGDataFlow):
             image_height = image_shape[0]
             image_width = image_shape[1]
 
-            target_height = image_height + max(cfg.crop_size[0] - image_height, 0)
-            target_width = image_width + max(cfg.crop_size[1] - image_width, 0)
+            target_height = image_height + max(cfg.img_h - image_height, 0)
+            target_width = image_width + max(cfg.img_w - image_width, 0)
 
             # Pad image with mean pixel value.
             mean_pixel = np.reshape(cfg.mean_pixel, [1, 1, 3])
@@ -153,10 +149,10 @@ class Data(RNGDataFlow):
             # Randomly crop the image and label.
             if label is not None:
                 image, label = random_crop(
-                    image, label, cfg.crop_size[0], cfg.crop_size[1])
+                    image, label, cfg.img_h, cfg.img_w)
 
             if self.flip:
-                image, label = flip_dim(image, label, prob=cfg.PROB_OF_FLIP, dim=1)
+                image, label = flip_dim(image, label, prob=cfg.flip_prob, dim=1)
 
         aug_img = np.copy(image) if self.save_img else None
         aug_label = np.copy(label) if self.save_img else None
@@ -169,32 +165,24 @@ class Data(RNGDataFlow):
         return [image, label]
 
     def get_data(self):
-        idxs = np.arange(len(self.imglist))
+        idxs = np.arange(len(self.img_list))
         if self.shuffle:
             self.rng.shuffle(idxs)
-        # image_height = 486
-        # image_width = 500
         for k in idxs:
             retval = self.generate_sample(k)
             if retval == None:
                 continue
             yield retval
 
-    def get_data_idx(self):
-        idxs = np.arange(len(self.imglist))
-        if self.shuffle:
-            self.rng.shuffle(idxs)
-        for k in idxs:
-            yield k
-
     def reset_state(self):
         super(Data, self).reset_state()
 
 if __name__ == '__main__':
-    df = Data('reader_test.txt', shuffle=False, flip=True, random_crop=True, random_expand=True, save_img=True)
+    # df = Data('voc_train_sbd_aug.txt', shuffle=False, flip=True, random_crop=True, random_expand=True, save_img=True)
+    df = Data('voc_train_sbd_aug.txt', shuffle=False, flip=False, random_crop=False, random_expand=False, save_img=True)
     df.reset_state()
 
     g = df.get_data()
-    for i in range(3):
+    for i in range(20):
         next(g)
 
