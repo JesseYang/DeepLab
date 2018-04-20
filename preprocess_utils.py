@@ -83,7 +83,7 @@ def pad_to_bounding_box(image, offset_height, offset_width, target_height,
   """
   if len(image.shape) != 3 and len(image.shape) != 2:
       raise ValueError('Wrong image rank')
-  image = image.astype(np.float) -  pad_value
+  image = image.astype(np.int) -  pad_value
   height, width = image.shape[0:2]
   if target_width < width:
       raise ValueError('target_width must be >= width')
@@ -96,7 +96,7 @@ def pad_to_bounding_box(image, offset_height, offset_width, target_height,
 
   padded = cv2.copyMakeBorder(image, offset_height, after_padding_height, offset_width, after_padding_width,cv2.BORDER_CONSTANT)
 
-  return padded + pad_value
+  return (padded + pad_value).astype(np.uint8)
 
 
 def _crop(image, offset_height, offset_width, crop_height, crop_width):

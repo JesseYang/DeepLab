@@ -1,37 +1,5 @@
-# Copyright 2018 The TensorFlow Authors All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-"""Contains common utility functions and classes for building dataset.
-
-This script contains utility functions and classes to converts dataset to
-TFRecord file format with Example protos.
-
-The Example proto contains the following fields:
-
-  image/encoded: encoded image content.
-  image/filename: image filename.
-  image/format: image file format.
-  image/height: image height.
-  image/width: image width.
-  image/channels: image channels.
-  image/segmentation/class/encoded: encoded semantic segmentation content.
-  image/segmentation/class/format: semantic segmentation file format.
-"""
 import collections
 import tensorflow as tf
-
 
 import os, sys, shutil
 import time
@@ -61,13 +29,14 @@ class Data(RNGDataFlow):
     def __init__(self,
                  filename_list, 
                  shuffle, flip, 
-                 random_crop, 
-                 random_expand, 
+                 random_crop,
+                 test_set = False, 
                  save_img=False, 
                  image_format='jpg', 
                  label_format='png', 
                  channels=3):
         self.filename_list = filename_list
+        self.test_set = test_set
         self.save_img = save_img
         self._image_format = image_format
         self._label_format = label_format
@@ -90,7 +59,6 @@ class Data(RNGDataFlow):
         self.shuffle = shuffle
         self.flip = flip
         self.random_crop = random_crop
-        self.random_expand = random_expand
 
     def size(self):
         return len(self.img_list)
@@ -103,40 +71,48 @@ class Data(RNGDataFlow):
 
         image = cv2.imread(img_path)
         label = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
-  
-        # s = image.shape
-        # h, w, c = image.shape
-
+                      
         if self.save_img:
             cv2.imwrite(os.path.join(SAVE_DIR, 'image_%d.jpg' % idx), image)
             cv2.imwrite(os.path.join(SAVE_DIR, 'label_%d.jpg' % idx), label)
+        if self.test_set:
+            image_height = image.shape[0]
+            image_width = image.shape[1]
+            target_height = image_height + max(cfg.crop_size[0] - image_height, 0)
+            target_width = image_width + max(cfg.crop_size[1] - image_width, 0)
+            top = int(max(target_height - image_height, 0)/2)
+            bottom = max(target_height - image_height - top, 0)
+            left = int(max(target_width - image_width, 0)/2)
+            right = max(target_width - image_width - left, 0)
+            # Pad image to crop_size with mean pixel value.
 
-        ori_image = image.copy()
-        ori_label = label.copy()
+            image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=cfg.mean_pixel)
 
-        '''
-        if FLAGS.min_resize_value is not None or FLAGS.max_resize_value is not None:
-            [image, label] = (resize_to_range(image=image,
-                                              label=label, 
-                                              min_size=cfg.min_resize_value, 
-                                              max_size=cfg.max_resize_value,
-                                              factor=cfg.resize_factor,
-                                              align_corners=True))
-        '''
+            if label is not None:
+                label = cv2.copyMakeBorder(label, top, bottom, left, right, cv2.BORDER_CONSTANT, value=cfg.ignore_label)
 
+            image, label = random_crop(image, label, target_height, target_width)
+
+            label = np.expand_dims(label, axis=-1)
+
+            # cv2.imwrite(os.path.join(SAVE_DIR, "%d_image_aug.jpg" % idx), image)
+            # cv2.imwrite(os.path.join(SAVE_DIR, "%d_label_aug.jpg" % idx), label)
+
+            return [image.astype(np.float32), label.astype(np.float32)]
+ 
         if self.random_crop:
-
             scale = get_random_scale(cfg.min_scale_factor,
                 cfg.max_scale_factor, cfg.scale_factor_step_size)
             image, label = randomly_scale_image_and_label(
                 image, label, scale)
 
+
             image_shape = image.shape
             image_height = image_shape[0]
             image_width = image_shape[1]
 
-            target_height = image_height + max(cfg.img_h - image_height, 0)
-            target_width = image_width + max(cfg.img_w - image_width, 0)
+            target_height = image_height + max(cfg.crop_size[0] - image_height, 0)
+            target_width = image_width + max(cfg.crop_size[1] - image_width, 0)
 
             # Pad image with mean pixel value.
             mean_pixel = np.reshape(cfg.mean_pixel, [1, 1, 3])
@@ -149,10 +125,10 @@ class Data(RNGDataFlow):
             # Randomly crop the image and label.
             if label is not None:
                 image, label = random_crop(
-                    image, label, cfg.img_h, cfg.img_w)
+                    image, label, cfg.crop_size[0], cfg.crop_size[1])
 
-            if self.flip:
-                image, label = flip_dim(image, label, prob=cfg.flip_prob, dim=1)
+        if self.flip:
+            image, label = flip_dim(image, label, prob=cfg.flip_prob, dim=1)
 
         aug_img = np.copy(image) if self.save_img else None
         aug_label = np.copy(label) if self.save_img else None
@@ -162,7 +138,8 @@ class Data(RNGDataFlow):
             cv2.imwrite(os.path.join(SAVE_DIR, "%d_label_aug.jpg" % idx), aug_label)
 
         label = np.expand_dims(label, axis=-1)
-        return [image, label]
+
+        return [image.astype(np.float32), label.astype(np.float32)]
 
     def get_data(self):
         idxs = np.arange(len(self.img_list))
@@ -178,11 +155,29 @@ class Data(RNGDataFlow):
         super(Data, self).reset_state()
 
 if __name__ == '__main__':
-    # df = Data('voc_train_sbd_aug.txt', shuffle=False, flip=True, random_crop=True, random_expand=True, save_img=True)
-    df = Data('voc_train_sbd_aug.txt', shuffle=False, flip=False, random_crop=False, random_expand=False, save_img=True)
-    df.reset_state()
+    ds = Data('voc_val.txt', shuffle=False, flip=False, random_crop=False, test_set=True, save_img=True)
+    # ds = Data('voc_train_sbd_aug.txt', shuffle=False, flip=False, random_crop=False, save_img=True)
 
-    g = df.get_data()
-    for i in range(20):
+    augmentors = [
+        imgaug.RandomOrderAug(
+            [imgaug.BrightnessScale((0.6, 1.4), clip=False),
+             imgaug.Contrast((0.6, 1.4), clip=False),
+             imgaug.Saturation(0.4, rgb=False),
+             imgaug.Lighting(0.1,
+                             eigval=np.asarray(
+                                 [0.2175, 0.0188, 0.0045][::-1]) * 255.0,
+                             eigvec=np.array(
+                                 [[-0.5675, 0.7192, 0.4009],
+                                  [-0.5808, -0.0045, -0.8140],
+                                  [-0.5836, -0.6948, 0.4203]],
+                                 dtype='float32')[::-1, ::-1]
+                             )]),
+    ]
+
+    ds = AugmentImageComponent(ds, augmentors)
+    ds.reset_state()
+
+    g = ds.get_data()
+    for i in range(3):
         next(g)
 

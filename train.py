@@ -7,6 +7,7 @@ import os
 import shutil
 import multiprocessing
 import json
+from abc import abstractmethod
 
 import tensorflow as tf
 from tensorflow.contrib.layers import variance_scaling_initializer
@@ -17,172 +18,221 @@ from tensorpack.tfutils.symbolic_functions import *
 from tensorpack.tfutils.common import get_tf_version_number
 from tensorpack.tfutils.summary import *
 from tensorpack.utils.gpu import get_nr_gpu
+from tensorpack.models import (
+    Conv2D, GlobalAvgPooling, BatchNorm, BNReLU, FullyConnected,
+    LinearWrap)
+from resnet_model import (
+    preresnet_group, preresnet_basicblock, preresnet_bottleneck,
+    resnet_group, resnet_basicblock, resnet_bottleneck, se_resnet_bottleneck,
+    resnet_backbone)
+
+from cfgs.config import cfg
+from reader import Data
+# from deeplab_utils import DeeplabModel, get_data, get_config
+# from train_utils import *
+
+class DeeplabModel(ModelDesc):
+    def __init__(self, data_format='NHWC', depth=50, mode='resnet'):
+        super(DeeplabModel, self).__init__()
+        self.data_format = data_format
+        self.mode = mode
+        basicblock = preresnet_basicblock if mode == 'preact' else resnet_basicblock
+        bottleneck = {
+            'resnet': resnet_bottleneck,
+            'preact': preresnet_bottleneck,
+            'se': se_resnet_bottleneck}[mode]
+        self.num_blocks, self.block_func = {
+            18: ([2, 2, 2, 2], basicblock),
+            34: ([3, 4, 6, 3], basicblock),
+            50: ([3, 4, 6, 3], bottleneck),
+            101: ([3, 4, 23, 3], bottleneck),
+            152: ([3, 8, 36, 3], bottleneck)
+        }[depth]
+
+    @staticmethod
+    def image_preprocess(image, bgr=True):
+        with tf.name_scope('image_preprocess'):
+            if image.dtype.base_dtype != tf.float32:
+                image = tf.cast(image, tf.float32)
+            image = image * (1.0 / 255)
+
+            mean = [0.485, 0.456, 0.406]    # rgb
+            std = [0.229, 0.224, 0.225]
+            if bgr:
+                mean = mean[::-1]
+                std = std[::-1]
+            image_mean = tf.constant(mean, dtype=tf.float32)
+            image_std = tf.constant(std, dtype=tf.float32)
+            image = (image - image_mean) / image_std
+            return image
 
 
-# try:
-#     from .commmon import cfg
-#     from .deeplab_utils import DeeplabModel, get_data, get_config
-# except Exception:
-#     from common import cfg
-#     from deeplab_utils import DeeplabModel, get_data, get_config
-from common import cfg
-import common
-from deeplab_utils import DeeplabModel, get_data, get_config
+    def _get_inputs(self):
+        return [InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'input'), 
+                InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 1], 'label')
+               ]
+   
+    def _get_logits(self, image):
+        with argscope([Conv2D, MaxPooling, GlobalAvgPooling, BatchNorm], data_format=self.data_format):
+            return resnet_backbone(image, self.num_blocks, preresnet_group if self.mode == 'preact' else resnet_group, self.block_func)       
+ 
+    def _build_graph(self, inputs):
+        # pass
+        image, label = inputs
+        self.batch_size = tf.shape(image)[0]
+        org_label = label
+        # when show image summary, first convert to RGB format
+        image_rgb = tf.reverse(image, axis=[-1])
+        label_without_255 = tf.where(tf.equal(label, cfg.ignore_label), tf.zeros_like(label), label)
+        label_without_255 = tf.cast(label_without_255 * 10, tf.uint8) 
+        tf.summary.image('input-image', image_rgb, max_outputs=3)
+        tf.summary.image('input-label', label_without_255, max_outputs=3)
+
+        image = DeeplabModel.image_preprocess(image, bgr=True)
+
+        if self.data_format == "NCHW":
+            image = tf.transpose(image, [0, 3, 1, 2])
+
+        # Compute the ASPP.
+        logits = self._get_logits(image)
+        logits_size = logits.get_shape().as_list()[1:3]
+        with argscope(Conv2D, filters=256, kernel_size=3, activation=BNReLU):
+            ASPP_1 = Conv2D('aspp_conv1', logits, kernel_size=1)
+            ASPP_2 = Conv2D('aspp_conv2', logits, dilation_rate=cfg.atrous_rates[0])
+            ASPP_3 = Conv2D('aspp_conv3', logits, dilation_rate=cfg.atrous_rates[1])
+            ASPP_4 = Conv2D('aspp_conv4', logits, dilation_rate=cfg.atrous_rates[2])
+            # ImagePooling = GlobalAvgPooling('image_pooling', logits)
+            # import pdb
+            # pdb.set_trace()
+            ImagePooling = tf.reduce_mean(logits, [1, 2], name='global_average_pooling', keepdims=True)
+            image_level_features = Conv2D('image_level_conv', ImagePooling, kernel_size=1)
+        image_level_features = tf.image.resize_bilinear(image_level_features, logits_size, name='upsample')
+        logits = tf.concat([ASPP_1, ASPP_2, ASPP_3, ASPP_4, image_level_features], -1, name='concat')
+        logits = Conv2D('conv_after_concat', logits, 256, 1, activation=BNReLU)
+        # logits = BatchNorm(logits)
+        logits = Conv2D('final_conv', logits, cfg.num_classes, 1)
+
+        # Compute softmax cross entropy loss for logits
+        logits = tf.image.resize_bilinear(logits, tf.shape(label)[1:3], align_corners=True)
+        label = tf.reshape(label, shape=[-1])
+        not_ignore_mask = tf.to_float(tf.not_equal(label, cfg.ignore_label)) * 1.0
+        one_hot_label = tf.one_hot(label, cfg.num_classes, on_value=1.0, off_value=0.0)
+
+        # valid_indices = tf.to_int32(label <= cfg.num_classes - 1)
+        # valid_logits = tf.dynamic_partition(tf.reshape(logits, shape=[-1, cfg.num_classes]), valid_indices, num_partitions=2)[1]
+        # valid_labels = tf.dynamic_partition(label, valid_indices, num_partitions=2)[1]
+
+        # loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.to_int32(valid_labels), logits=valid_logits)
+        # self.cost = tf.reduce_sum(loss, name='cost')
+        if not cfg.freeze_batch_norm:
+            train_var_list = [v for v in tf.trainable_variables()]
+        else:
+            train_var_list = [v for v in tf.trainable_variabels() if 'beta' not in v.name and 'gamma' not in v.name]
+        cross_entropy = tf.losses.softmax_cross_entropy(one_hot_label, tf.reshape(logits, shape=[-1, cfg.num_classes]), weights=not_ignore_mask)
+        
+        self.cost = tf.add(cross_entropy, cfg.weight_decay * tf.add_n([tf.nn.l2_loss(v) for v in train_var_list]), name='cost')
+        
+        # self.cost = tf.identity(cost, name='cost')
+
+        # compute the mean_iou
+        # miou = MIOU(logits, label)
+        predictions = tf.argmax(tf.nn.softmax(logits), 3, name='predicts')
+        out_pred = predictions * 10
+        out_pred = tf.cast(tf.expand_dims(out_pred, -1), tf.uint8)
+        out_pred = tf.where(tf.equal(org_label, cfg.ignore_label), tf.zeros_like(org_label), out_pred)
+        tf.summary.image('input-preds', tf.cast(out_pred, tf.uint8), max_outputs=3)
+
+        predictions = tf.reshape(predictions, shape=[-1], name='flat_predicts')
+        # weights = tf.to_float(tf.not_equal(labels, cfg.ignore_label))
+        label = tf.where(tf.equal(label, cfg.ignore_label), tf.zeros_like(label), label)
+        miou = tf.metrics.mean_iou(label, predictions, cfg.num_classes, weights=not_ignore_mask)
+        miou = tf.identity(miou[0], name='eval_miou')
+    
+        add_moving_summary(self.cost, miou)
+
+    def _get_optimizer(self):
+        lr = get_scalar_var('learning_rate', cfg.base_lr, summary=True)
+        optimizer = tf.train.MomentumOptimizer(lr, cfg.momentum)
+        
+        return optimizer
+
+
+def get_data(train_or_test, batch_size):
+    is_train = train_or_test == 'train'
+
+    filename_list = cfg.train_list if is_train else cfg.test_list
+    ds = Data(filename_list, shuffle=is_train, flip=is_train, random_crop=is_train, test_set = not is_train)
+    sample_num = ds.size()
+
+    if is_train:
+        augmentors = [
+            imgaug.RandomOrderAug(
+                [imgaug.BrightnessScale((0.6, 1.4), clip=False),
+                 imgaug.Contrast((0.6, 1.4), clip=False),
+                 imgaug.Saturation(0.4, rgb=False),
+                 imgaug.Lighting(0.1,
+                                 eigval=np.asarray(
+                                     [0.2175, 0.0188, 0.0045][::-1]) * 255.0,
+                                 eigvec=np.array(
+                                     [[-0.5675, 0.7192, 0.4009],
+                                      [-0.5808, -0.0045, -0.8140],
+                                      [-0.5836, -0.6948, 0.4203]],
+                                     dtype='float32')[::-1, ::-1]
+                                 )]),
+        ]
+    else:
+        augmentors = []
+
+#    ds = AugmentImageComponent(ds, augmentors)
+    ds = BatchData(ds, batch_size, remainder=not is_train)
+    if is_train:
+        ds = PrefetchDataZMQ(ds, min(6, multiprocessing.cpu_count()))
+    return ds, sample_num
+
+def get_config(args, model):
+
+    ds_train, train_sample_num = get_data('train', args.batch_size_per_gpu)
+    ds_test, _ = get_data('test', args.batch_size_per_gpu)
+
+    training_number_of_steps = 300 * train_sample_num // (args.batch_size_per_gpu * get_nr_gpu())
+
+    steps_per_epoch = train_sample_num // (args.batch_size_per_gpu * get_nr_gpu())
+
+    epoch_num = int(cfg.max_itr_num / steps_per_epoch)
+
+    callbacks = [
+      ModelSaver(),
+#      PeriodicTrigger(InferenceRunner(ds_test, ScalarStats(['cost', 'eval_miou'])), every_k_epochs=3),
+      HyperParamSetterWithFunc('learning_rate', lambda e, x: (cfg.base_lr * (1 - e * steps_per_epoch / cfg.max_itr_num) ** cfg.learning_power)),
+      HumanHyperParamSetter('learning_rate'),
+    ]
+
+    return TrainConfig(
+        dataflow=ds_train,
+        callbacks=callbacks,
+        model=model,
+        steps_per_epoch=steps_per_epoch,
+        max_epoch=epoch_num,
+    )
+
 
 if __name__ == '__main__':
 
-    flags = tf.app.flags
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.', default="0")
+    parser.add_argument('--batch_size_per_gpu', help='batch size per gpu', type=int, default=8)
+    parser.add_argument('--load', help='load model')
+    parser.add_argument('--flops', action='store_true', help='print flops and exit')
+    parser.add_argument('--logdir', help='train log directory name')
+    args = parser.parse_args()
 
-    FLAGS = flags.FLAGS
 
-    # # Settings for multi-GPUs/multi-replicas training.
-
-    # flags.DEFINE_string('gpu', '0', help='comma separated list of GPU(s) to use.')
-
-    # flags.DEFINE_integer('num_clones', 1, 'Number of clones to deploy.')
-
-    # flags.DEFINE_boolean('clone_on_cpu', False, 'Use CPUs to deploy clones.')
-
-    # flags.DEFINE_integer('num_replicas', 1, 'Number of worker replicas.')
-
-    # flags.DEFINE_integer('startup_delay_steps', 15,
-    #                      'Number of training steps between replicas startup.')
-
-    # flags.DEFINE_integer('num_ps_tasks', 0,
-    #                      'The number of parameter servers. If the value is 0, then '
-    #                      'the parameters are handled locally by the worker.')
-
-    # flags.DEFINE_string('master', '', 'BNS name of the tensorflow server')
-
-    # flags.DEFINE_integer('task', 0, 'The task ID.')
-
-    # # Settings for logging.
-
-    # flags.DEFINE_string('train_logdir', None,
-    #                     'Where the checkpoint and logs are stored.')
-
-    # flags.DEFINE_integer('log_steps', 10,
-    #                      'Display logging information at every log_steps.')
-
-    # flags.DEFINE_integer('save_interval_secs', 1200,
-    #                      'How often, in seconds, we save the model to disk.')
-
-    # flags.DEFINE_integer('save_summaries_secs', 600,
-    #                      'How often, in seconds, we compute the summaries.')
-
-    # flags.DEFINE_boolean('save_summaries_images', False,
-    #                      'Save sample inputs, labels, and semantic predictions as images to summary.')
-
-    # # Settings for training strategy.
-
-    # flags.DEFINE_enum('learning_policy', 'poly', ['poly', 'step'],
-    #                   'Learning rate policy for training.')
-
-    # # Use 0.007 when training on PASCAL augmented training set, train_aug. When
-    # # fine-tuning on PASCAL trainval set, use learning rate=0.0001.
-    # flags.DEFINE_float('base_learning_rate', .0001,
-    #                    'The base learning rate for model training.')
-
-    # flags.DEFINE_float('learning_rate_decay_factor', 0.1,
-    #                    'The rate to decay the base learning rate.')
-
-    # flags.DEFINE_integer('learning_rate_decay_step', 2000,
-    #                      'Decay the base learning rate at a fixed step.')
-
-    # flags.DEFINE_float('learning_power', 0.9,
-    #                    'The power value used in the poly learning policy.')
-
-    # flags.DEFINE_integer('training_number_of_steps', 30000,
-    #                      'The number of steps used for training')
-
-    # flags.DEFINE_float('momentum', 0.9, 'The momentum value to use')
-
-    # # When fine_tune_batch_norm=True, use at least batch size larger than 12
-    # # (batch size more than 16 is better). Otherwise, one could use smaller batch
-    # # size and set fine_tune_batch_norm=False.
-    # flags.DEFINE_integer('train_batch_size', 8,
-    #                      'The number of images in each batch during training.')
-
-    # flags.DEFINE_float('weight_decay', 0.00004,
-    #                    'The value of the weight decay for training.')
-
-    # flags.DEFINE_multi_integer('train_crop_size', [513, 513],
-    #                            'Image crop size [height, width] during training.')
-
-    # flags.DEFINE_float('last_layer_gradient_multiplier', 1.0,
-    #                    'The gradient multiplier for last layers, which is used to '
-    #                    'boost the gradient of last layers if the value > 1.')
-
-    # flags.DEFINE_boolean('upsample_logits', True,
-    #                      'Upsample logits during training.')
-
-    # # Settings for fine-tuning the network.
-
-    # flags.DEFINE_string('tf_initial_checkpoint', None,
-    #                     'The initial checkpoint in tensorflow format.')
-
-    # # Set to False if one does not want to re-use the trained classifier weights.
-    # flags.DEFINE_boolean('initialize_last_layer', True,
-    #                      'Initialize the last layer.')
-
-    # flags.DEFINE_boolean('last_layers_contain_logits_only', False,
-    #                      'Only consider logits as last layers or not.')
-
-    # flags.DEFINE_integer('slow_start_step', 0,
-    #                      'Training model with small learning rate for few steps.')
-
-    # flags.DEFINE_float('slow_start_learning_rate', 1e-4,
-    #                    'Learning rate employed during slow start.')
-
-    # # Set to True if one wants to fine-tune the batch norm parameters in DeepLabv3.
-    # # Set to False and use small batch size to save GPU memory.
-    # flags.DEFINE_boolean('fine_tune_batch_norm', True,
-    #                      'Fine tune the batch norm parameters or not.')
-
-    # flags.DEFINE_float('min_scale_factor', 0.5,
-    #                    'Mininum scale factor for data augmentation.')
-
-    # flags.DEFINE_float('max_scale_factor', 2.,
-    #                    'Maximum scale factor for data augmentation.')
-
-    # flags.DEFINE_float('scale_factor_step_size', 0.25,
-    #                    'Scale factor step size for data augmentation.')
-
-    # # For `xception_65`, use atrous_rates = [12, 24, 36] if output_stride = 8, or
-    # # rates = [6, 12, 18] if output_stride = 16. For `mobilenet_v2`, use None. Note
-    # # one could use different atrous_rates/output_stride during training/evaluation.
-    # flags.DEFINE_multi_integer('atrous_rates', None,
-    #                            'Atrous rates for atrous spatial pyramid pooling.')
-
-    # flags.DEFINE_integer('output_stride', 16,
-    #                      'The ratio of input to output spatial resolution.')
-
-    # # Dataset settings.
-    # flags.DEFINE_string('dataset', 'pascal_voc_seg',
-    #                     'Name of the segmentation dataset.')
-
-    # flags.DEFINE_string('train_split', 'train',
-    #                     'Which split of the dataset to be used for training')
-
-    # flags.DEFINE_string('dataset_dir', None, 'Where the dataset reside.')
-  
-
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.', default='0,1')
-    # parser.add_argument('--batch_size_per_gpu', help='batch size per gpu', type=int, default=32)
-    # parser.add_argument('--itr', help='number of iterations', type=int, default=60000)
-    # parser.add_argument('--load', help='load model')
-    # parser.add_argument('--logdir', help="directory of logging", default=None)
-    # parser.add_argument('--flops', action="store_true", help="print flops and exit")
-    # args = parser.parse_args()
-
-    if FLAGS.gpu:
-        os.environ['CUDA_VISIBLE_DEVICES'] = FLAGS.gpu
+    if args.gpu:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
     model = DeeplabModel()
     
-    flops = False
-    if flops:
+    if args.flops:
         input_desc = [
             InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'input'),
             InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'label')
@@ -197,20 +247,18 @@ if __name__ == '__main__':
             cmd='op',
             options=tf.profiler.ProfileOptionBuilder.float_operation())
     else:
-        # assert args.gpu is not None, "Need to specify a list of gpu for training!"
-        if FLAGS.train_logdir != None:
-            logger.set_logger_dir(os.path.join("train_log", FLAGS.train_logdir))
+        if args.logdir != None:
+            logger.set_logger_dir(os.path.join("train_log", args.logdir))
         else:
             logger.auto_set_dir()
-        config = get_config(FLAGS, model)
-        if FLAGS.gpu != None:
-            config.nr_tower = FLAGS.num_clones # len(args.gpu.split(','))
+        nr_tower = get_nr_gpu()
+        config = get_config(args, model)
 
-        # if args.load:
-        #     if args.load.endswith('npz'):
-        #         config.session_init = DictRestore(dict(np.load(args.load)))
-        #     else:
-        #         config.session_init = SaverRestore(args.load)
+        if args.load:
+            if args.load.endswith('npz'):
+                config.session_init = DictRestore(dict(np.load(args.load)))
+            else:
+                config.session_init = SaverRestore(args.load)
 
-        trainer = SyncMultiGPUTrainerParameterServer(max(get_nr_gpu(), 1))
+        trainer = SyncMultiGPUTrainerParameterServer(nr_tower)
         launch_train_with_config(config, trainer)
