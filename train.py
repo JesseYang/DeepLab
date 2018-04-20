@@ -203,7 +203,7 @@ def get_config(args, model):
     callbacks = [
       ModelSaver(),
 #      PeriodicTrigger(InferenceRunner(ds_test, ScalarStats(['cost', 'eval_miou'])), every_k_epochs=3),
-      HyperParamSetterWithFunc('learning_rate', lambda e, x: (cfg.base_lr * (1 - e * steps_per_epoch / cfg.max_itr_num) ** cfg.learning_power)),
+      HyperParamSetterWithFunc('learning_rate', lambda e, x: (((cfg.base_lr-cfg.end_lr) * (1 - steps_per_epoch / cfg.max_itr_num) ** cfg.learning_power)+cfg.end_lr)),
       HumanHyperParamSetter('learning_rate'),
     ]
 
