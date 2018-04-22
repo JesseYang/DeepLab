@@ -28,8 +28,6 @@ from resnet_model import (
 
 from cfgs.config import cfg
 from reader import Data
-# from deeplab_utils import DeeplabModel, get_data, get_config
-# from train_utils import *
 
 class DeeplabModel(ModelDesc):
     def __init__(self, data_format='NHWC', depth=50, mode='resnet'):
@@ -77,7 +75,6 @@ class DeeplabModel(ModelDesc):
             return resnet_backbone(image, self.num_blocks, preresnet_group if self.mode == 'preact' else resnet_group, self.block_func)       
  
     def _build_graph(self, inputs):
-        # pass
         image, label = inputs
         self.batch_size = tf.shape(image)[0]
         org_label = label
@@ -93,17 +90,17 @@ class DeeplabModel(ModelDesc):
         if self.data_format == "NCHW":
             image = tf.transpose(image, [0, 3, 1, 2])
 
-        # Compute the ASPP.
+        # the backbone part
         logits = self._get_logits(image)
         logits_size = logits.get_shape().as_list()[1:3]
+
+        # Compute the ASPP.
         with argscope(Conv2D, filters=256, kernel_size=3, activation=BNReLU):
             ASPP_1 = Conv2D('aspp_conv1', logits, kernel_size=1)
             ASPP_2 = Conv2D('aspp_conv2', logits, dilation_rate=cfg.atrous_rates[0])
             ASPP_3 = Conv2D('aspp_conv3', logits, dilation_rate=cfg.atrous_rates[1])
             ASPP_4 = Conv2D('aspp_conv4', logits, dilation_rate=cfg.atrous_rates[2])
             # ImagePooling = GlobalAvgPooling('image_pooling', logits)
-            # import pdb
-            # pdb.set_trace()
             ImagePooling = tf.reduce_mean(logits, [1, 2], name='global_average_pooling', keepdims=True)
             image_level_features = Conv2D('image_level_conv', ImagePooling, kernel_size=1)
         image_level_features = tf.image.resize_bilinear(image_level_features, logits_size, name='upsample')
@@ -145,10 +142,13 @@ class DeeplabModel(ModelDesc):
         predictions = tf.reshape(predictions, shape=[-1], name='flat_predicts')
         # weights = tf.to_float(tf.not_equal(labels, cfg.ignore_label))
         label = tf.where(tf.equal(label, cfg.ignore_label), tf.zeros_like(label), label)
-        miou = tf.metrics.mean_iou(label, predictions, cfg.num_classes, weights=not_ignore_mask)
-        miou = tf.identity(miou[0], name='eval_miou')
+        label = tf.cast(label, tf.int64)
+
+        miou, miou_update_op = tf.metrics.mean_iou(label, predictions, cfg.num_classes, weights=not_ignore_mask)
+        miou = tf.identity(miou, name='miou')
+        miou_update_op = tf.identity(miou_update_op, name='miou_update_op')
     
-        add_moving_summary(self.cost, miou)
+        add_moving_summary(self.cost)
 
     def _get_optimizer(self):
         lr = get_scalar_var('learning_rate', cfg.base_lr, summary=True)
@@ -156,6 +156,31 @@ class DeeplabModel(ModelDesc):
         
         return optimizer
 
+class CalMIOU(Inferencer):
+
+    def __init__(self):
+
+        self.inf_miou_name = 'InferenceTower/miou:0'
+        self.names = ["miou_update_op"]
+
+    def _get_fetches(self):
+        return self.names
+
+    def _after_inference(self):
+        sess = tf.get_default_session()
+        graph = sess.graph
+        # the following code should find the target names:
+        #   ['tower0/miou', 'tower0/miou_update_op', ['tower1/miou', 'tower1/miou_update_op', ...
+        #    'InferenceTower/miou', 'InferenceTower/miou_update_op']
+        '''
+        op_list = tf.get_default_session().graph.get_operations()
+        op_names = [e.name for e in op_list]
+        target_names = [e for e in op_names if "miou" in e]
+        '''
+        val_miou = graph.get_tensor_by_name(self.val_miou_name)
+        val_miou = sess.run(val_miou)
+        ret = {"val_miou": val_miou}
+        return ret
 
 def get_data(train_or_test, batch_size):
     is_train = train_or_test == 'train'
@@ -202,8 +227,8 @@ def get_config(args, model):
 
     callbacks = [
       ModelSaver(),
-#      PeriodicTrigger(InferenceRunner(ds_test, ScalarStats(['cost', 'eval_miou'])), every_k_epochs=3),
-      HyperParamSetterWithFunc('learning_rate', lambda e, x: (((cfg.base_lr-cfg.end_lr) * (1 - steps_per_epoch / cfg.max_itr_num) ** cfg.learning_power)+cfg.end_lr)),
+      PeriodicTrigger(InferenceRunner(ds_test, CalMIOU()), every_k_epochs=3),
+      HyperParamSetterWithFunc('learning_rate', lambda e, x: (((cfg.base_lr-cfg.end_lr) * (1 - steps_per_epoch * e / cfg.max_itr_num) ** cfg.learning_power)+cfg.end_lr)),
       HumanHyperParamSetter('learning_rate'),
     ]
 

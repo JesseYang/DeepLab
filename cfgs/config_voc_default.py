@@ -25,7 +25,7 @@ cfg.flip_prob = 0.5
 
 cfg.num_classes = 21
 
-cfg.train_list = 'voc_train_sbd_aug100.txt'
+cfg.train_list = 'voc_train_sbd_aug.txt'
 cfg.test_list = 'voc_val.txt'
 
 cfg.max_itr_num = 30000
