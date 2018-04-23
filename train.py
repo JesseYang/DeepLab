@@ -64,7 +64,6 @@ class DeeplabModel(ModelDesc):
             image = (image - image_mean) / image_std
             return image
 
-
     def _get_inputs(self):
         return [InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'input'), 
                 InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 1], 'label')
@@ -80,10 +79,10 @@ class DeeplabModel(ModelDesc):
         org_label = label
         # when show image summary, first convert to RGB format
         image_rgb = tf.reverse(image, axis=[-1])
-        label_without_255 = tf.where(tf.equal(label, cfg.ignore_label), tf.zeros_like(label), label)
-        label_without_255 = tf.cast(label_without_255 * 10, tf.uint8) 
+        label_shown = tf.where(tf.equal(label, cfg.ignore_label), tf.zeros_like(label), label)
+        label_shown = tf.cast(label_shown * 10, tf.uint8) 
         tf.summary.image('input-image', image_rgb, max_outputs=3)
-        tf.summary.image('input-label', label_without_255, max_outputs=3)
+        tf.summary.image('input-label', label_shown, max_outputs=3)
 
         image = DeeplabModel.image_preprocess(image, bgr=True)
 
@@ -111,44 +110,33 @@ class DeeplabModel(ModelDesc):
 
         # Compute softmax cross entropy loss for logits
         logits = tf.image.resize_bilinear(logits, tf.shape(label)[1:3], align_corners=True)
-        label = tf.reshape(label, shape=[-1])
-        not_ignore_mask = tf.to_float(tf.not_equal(label, cfg.ignore_label)) * 1.0
-        one_hot_label = tf.one_hot(label, cfg.num_classes, on_value=1.0, off_value=0.0)
+        label_flatten = tf.reshape(label, shape=[-1])
+        mask = tf.to_float(tf.not_equal(label_flatten, cfg.ignore_label)) * 1.0
+        one_hot_label = tf.one_hot(label_flatten, cfg.num_classes, on_value=1.0, off_value=0.0)
 
-        # valid_indices = tf.to_int32(label <= cfg.num_classes - 1)
-        # valid_logits = tf.dynamic_partition(tf.reshape(logits, shape=[-1, cfg.num_classes]), valid_indices, num_partitions=2)[1]
-        # valid_labels = tf.dynamic_partition(label, valid_indices, num_partitions=2)[1]
-
-        # loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.to_int32(valid_labels), logits=valid_logits)
-        # self.cost = tf.reduce_sum(loss, name='cost')
-        if not cfg.freeze_batch_norm:
-            train_var_list = [v for v in tf.trainable_variables()]
+        loss = tf.losses.softmax_cross_entropy(one_hot_label, tf.reshape(logits, shape=[-1, cfg.num_classes]), weights=mask)
+        if cfg.weight_decay > 0:
+            wd_cost = regularize_cost('.*/W', l2_regularizer(cfg.weight_decay), name='l2_regularize_loss')
         else:
-            train_var_list = [v for v in tf.trainable_variabels() if 'beta' not in v.name and 'gamma' not in v.name]
-        cross_entropy = tf.losses.softmax_cross_entropy(one_hot_label, tf.reshape(logits, shape=[-1, cfg.num_classes]), weights=not_ignore_mask)
+            wd_cost = tf.constant(0.0)
+
+        self.cost = tf.add_n([loss, wd_cost], name='cost')
         
-        self.cost = tf.add(cross_entropy, cfg.weight_decay * tf.add_n([tf.nn.l2_loss(v) for v in train_var_list]), name='cost')
-        
-        # self.cost = tf.identity(cost, name='cost')
+        pred = tf.argmax(tf.nn.softmax(logits), 3, name='predicts')
+        pred_shown = pred * 10
+        pred_shown = tf.cast(tf.expand_dims(pred_shown, -1), tf.uint8)
+        pred_shown = tf.where(tf.equal(label, cfg.ignore_label), tf.zeros_like(label), pred_shown)
+        tf.summary.image('input-preds', tf.cast(pred_shown, tf.uint8), max_outputs=3)
 
         # compute the mean_iou
-        # miou = MIOU(logits, label)
-        predictions = tf.argmax(tf.nn.softmax(logits), 3, name='predicts')
-        out_pred = predictions * 10
-        out_pred = tf.cast(tf.expand_dims(out_pred, -1), tf.uint8)
-        out_pred = tf.where(tf.equal(org_label, cfg.ignore_label), tf.zeros_like(org_label), out_pred)
-        tf.summary.image('input-preds', tf.cast(out_pred, tf.uint8), max_outputs=3)
-
-        predictions = tf.reshape(predictions, shape=[-1], name='flat_predicts')
-        # weights = tf.to_float(tf.not_equal(labels, cfg.ignore_label))
-        label = tf.where(tf.equal(label, cfg.ignore_label), tf.zeros_like(label), label)
-        label = tf.cast(label, tf.int64)
-
-        miou, miou_update_op = tf.metrics.mean_iou(label, predictions, cfg.num_classes, weights=not_ignore_mask)
+        pred_flatten = tf.reshape(pred, shape=[-1])
+        label_flatten = tf.where(tf.equal(label_flatten, cfg.ignore_label), tf.zeros_like(label_flatten), label_flatten)
+        label_flatten = tf.cast(label_flatten, tf.int64)
+        miou, miou_update_op = tf.metrics.mean_iou(label_flatten, pred_flatten, cfg.num_classes, weights=mask)
         miou = tf.identity(miou, name='miou')
         miou_update_op = tf.identity(miou_update_op, name='miou_update_op')
     
-        add_moving_summary(self.cost)
+        add_moving_summary(loss, wd_cost, self.cost)
 
     def _get_optimizer(self):
         lr = get_scalar_var('learning_rate', cfg.base_lr, summary=True)
@@ -160,7 +148,7 @@ class CalMIOU(Inferencer):
 
     def __init__(self):
 
-        self.inf_miou_name = 'InferenceTower/miou:0'
+        self.val_miou_name = 'InferenceTower/miou:0'
         self.names = ["miou_update_op"]
 
     def _get_fetches(self):
@@ -228,7 +216,7 @@ def get_config(args, model):
     callbacks = [
       ModelSaver(),
       PeriodicTrigger(InferenceRunner(ds_test, CalMIOU()), every_k_epochs=3),
-      HyperParamSetterWithFunc('learning_rate', lambda e, x: (((cfg.base_lr-cfg.end_lr) * (1 - steps_per_epoch * e / cfg.max_itr_num) ** cfg.learning_power)+cfg.end_lr)),
+      HyperParamSetterWithFunc('learning_rate', lambda e, x: (((cfg.base_lr - cfg.end_lr) * (1 - steps_per_epoch * e / cfg.max_itr_num) ** cfg.learning_power) + cfg.end_lr)),
       HumanHyperParamSetter('learning_rate'),
     ]
 
