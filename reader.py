@@ -101,10 +101,8 @@ class Data(RNGDataFlow):
             return [image.astype(np.float32), label.astype(np.float32)]
  
         if self.random_crop:
-            scale = get_random_scale(cfg.min_scale_factor,
-                cfg.max_scale_factor, cfg.scale_factor_step_size)
-            image, label = randomly_scale_image_and_label(
-                image, label, scale)
+            scale = get_random_scale(cfg.min_scale_factor, cfg.max_scale_factor)
+            image, label = randomly_scale_image_and_label(image, label, scale)
 
 
             image_shape = image.shape

@@ -5,7 +5,7 @@ cfg = edict()
 cfg.base_lr = 7e-3
 cfg.end_lr = 1e-6
 
-cfg.weight_decay = 5e-4
+cfg.weight_decay = 1e-4
 
 cfg.crop_size = [513, 513]
 
