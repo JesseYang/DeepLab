@@ -21,7 +21,7 @@ from tensorpack.utils.gpu import get_nr_gpu
 from tensorpack.models import (
     Conv2D, GlobalAvgPooling, BatchNorm, BNReLU, FullyConnected,
     LinearWrap)
-from resnet_model import (
+from resnet_model_copy import (
     preresnet_group, preresnet_basicblock, preresnet_bottleneck,
     resnet_group, resnet_basicblock, resnet_bottleneck, se_resnet_bottleneck,
     resnet_backbone)
@@ -30,7 +30,7 @@ from cfgs.config import cfg
 from reader import Data
 
 class DeeplabModel(ModelDesc):
-    def __init__(self, data_format='NHWC', depth=50, mode='resnet'):
+    def __init__(self, data_format='NHWC', depth=101, mode='resnet'):
         super(DeeplabModel, self).__init__()
         self.data_format = data_format
         self.mode = mode
@@ -54,7 +54,7 @@ class DeeplabModel(ModelDesc):
                 image = tf.cast(image, tf.float32)
             image = image * (1.0 / 255)
 
-            mean = [0.485, 0.456, 0.406]    # rgb
+            mean = [0.485, 0.456, 0.407]    # rgb
             std = [0.229, 0.224, 0.225]
             if bgr:
                 mean = mean[::-1]
@@ -65,9 +65,8 @@ class DeeplabModel(ModelDesc):
             return image
 
     def _get_inputs(self):
-        return [InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'input'), 
-                InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 1], 'label')
-               ]
+        return [InputDesc(tf.uint8, [None, None, None, 3], 'input'),
+                InputDesc(tf.uint8, [None, None, None, 1], 'label')]
    
     def _get_logits(self, image):
         with argscope([Conv2D, MaxPooling, GlobalAvgPooling, BatchNorm], data_format=self.data_format):
@@ -91,7 +90,7 @@ class DeeplabModel(ModelDesc):
 
         # the backbone part
         logits = self._get_logits(image)
-        logits_size = logits.get_shape().as_list()[1:3]
+        logits_size = tf.shape(logits)[1:3]
 
         # Compute the ASPP.
         with argscope(Conv2D, filters=256, kernel_size=3, activation=BNReLU):
@@ -132,7 +131,7 @@ class DeeplabModel(ModelDesc):
         pred_flatten = tf.reshape(pred, shape=[-1])
         label_flatten = tf.where(tf.equal(label_flatten, cfg.ignore_label), tf.zeros_like(label_flatten), label_flatten)
         label_flatten = tf.cast(label_flatten, tf.int64)
-        miou, miou_update_op = tf.metrics.mean_iou(label_flatten, pred_flatten, cfg.num_classes, weights=mask)
+        miou, miou_update_op = tf.metrics.mean_iou(label_flatten, pred_flatten, cfg.num_classes, weights=mask, name='miou_metric')
         miou = tf.identity(miou, name='miou')
         miou_update_op = tf.identity(miou_update_op, name='miou_update_op')
     
@@ -150,6 +149,11 @@ class CalMIOU(Inferencer):
 
         self.val_miou_name = 'InferenceTower/miou:0'
         self.names = ["miou_update_op"]
+        running_vars = tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope="miou_metric")
+        self.running_vars_initializer = tf.variables_initializer(var_list=running_vars)
+
+    def _before_inference(self):
+        tf.get_default_session().run(self.running_vars_initializer)
 
     def _get_fetches(self):
         return self.names
@@ -205,7 +209,7 @@ def get_data(train_or_test, batch_size):
 def get_config(args, model):
 
     ds_train, train_sample_num = get_data('train', args.batch_size_per_gpu)
-    ds_test, _ = get_data('test', args.batch_size_per_gpu)
+    ds_test, _ = get_data('test', 1) #args.batch_size_per_gpu)
 
     training_number_of_steps = 300 * train_sample_num // (args.batch_size_per_gpu * get_nr_gpu())
 
@@ -215,7 +219,7 @@ def get_config(args, model):
 
     callbacks = [
       ModelSaver(),
-      PeriodicTrigger(InferenceRunner(ds_test, CalMIOU()), every_k_epochs=3),
+      InferenceRunner(ds_test, CalMIOU()),
       HyperParamSetterWithFunc('learning_rate', lambda e, x: (((cfg.base_lr - cfg.end_lr) * (1 - steps_per_epoch * e / cfg.max_itr_num) ** cfg.learning_power) + cfg.end_lr)),
       HumanHyperParamSetter('learning_rate'),
     ]
@@ -246,9 +250,13 @@ if __name__ == '__main__':
     model = DeeplabModel()
     
     if args.flops:
+#        input_desc = [
+#            InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'input'),
+#            InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'label')
+#        ]
         input_desc = [
-            InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'input'),
-            InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'label')
+            InputDesc(tf.uint8, [None, None, None, 3], 'input'),
+            InputDesc(tf.uint8, [None, None, None, 1], 'label')
         ]
         input = PlaceholderInput()
         input.setup(input_desc)
