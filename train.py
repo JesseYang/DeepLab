@@ -131,7 +131,10 @@ class DeeplabModel(ModelDesc):
         pred_flatten = tf.reshape(pred, shape=[-1])
         label_flatten = tf.where(tf.equal(label_flatten, cfg.ignore_label), tf.zeros_like(label_flatten), label_flatten)
         label_flatten = tf.cast(label_flatten, tf.int64)
-        miou, miou_update_op = tf.metrics.mean_iou(label_flatten, pred_flatten, cfg.num_classes, weights=mask, name='miou_metric')
+        miou, miou_update_op = tf.metrics.mean_iou(label_flatten, pred_flatten, cfg.num_classes, weights=mask, name="metric_scope")
+        running_vars = tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope="InferenceTower/metric_scope")
+        # running_vars = tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES)
+        miou_reset_op = tf.variables_initializer(var_list=running_vars, name='miou_reset_op')
         miou = tf.identity(miou, name='miou')
         miou_update_op = tf.identity(miou_update_op, name='miou_update_op')
     
@@ -146,21 +149,27 @@ class DeeplabModel(ModelDesc):
 class CalMIOU(Inferencer):
 
     def __init__(self):
-
-        self.val_miou_name = 'InferenceTower/miou:0'
+        self.cal_miou_name = 'InferenceTower/miou:0'
+        self.reset_miou_name = 'InferenceTower/miou_reset_op'
+        self.update_miou_name = 'InferenceTower/miou_update_op'
         self.names = ["miou_update_op"]
-        running_vars = tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope="miou_metric")
-        self.running_vars_initializer = tf.variables_initializer(var_list=running_vars)
+
+    def _get_from_graph(self):
+        sess = tf.get_default_session()
+        graph = sess.graph
+        reset_miou = graph.get_operation_by_name(self.reset_miou_name)
+        update_miou = graph.get_operation_by_name(self.update_miou_name)
+        cal_miou = graph.get_tensor_by_name(self.cal_miou_name)
+        return sess, reset_miou, update_miou, cal_miou
 
     def _before_inference(self):
-        tf.get_default_session().run(self.running_vars_initializer)
+        sess, reset_miou, update_miou, cal_miou = self._get_from_graph()
+        sess.run(reset_miou)
 
     def _get_fetches(self):
         return self.names
 
     def _after_inference(self):
-        sess = tf.get_default_session()
-        graph = sess.graph
         # the following code should find the target names:
         #   ['tower0/miou', 'tower0/miou_update_op', ['tower1/miou', 'tower1/miou_update_op', ...
         #    'InferenceTower/miou', 'InferenceTower/miou_update_op']
@@ -169,9 +178,9 @@ class CalMIOU(Inferencer):
         op_names = [e.name for e in op_list]
         target_names = [e for e in op_names if "miou" in e]
         '''
-        val_miou = graph.get_tensor_by_name(self.val_miou_name)
-        val_miou = sess.run(val_miou)
-        ret = {"val_miou": val_miou}
+        sess, reset_miou, update_miou, cal_miou = self._get_from_graph()
+        cal_miou = sess.run(cal_miou)
+        ret = {"val_miou": cal_miou}
         return ret
 
 def get_data(train_or_test, batch_size):
@@ -236,7 +245,7 @@ def get_config(args, model):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.', default="0")
+    parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.', default="1")
     parser.add_argument('--batch_size_per_gpu', help='batch size per gpu', type=int, default=8)
     parser.add_argument('--load', help='load model')
     parser.add_argument('--flops', action='store_true', help='print flops and exit')
@@ -250,10 +259,6 @@ if __name__ == '__main__':
     model = DeeplabModel()
     
     if args.flops:
-#        input_desc = [
-#            InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'input'),
-#            InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'label')
-#        ]
         input_desc = [
             InputDesc(tf.uint8, [None, None, None, 3], 'input'),
             InputDesc(tf.uint8, [None, None, None, 1], 'label')
