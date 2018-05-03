@@ -9,17 +9,35 @@ import pdb
 from tensorpack.tfutils.argscope import argscope, get_arg_scope
 from tensorpack.models import (
     Conv2D, GlobalAvgPooling, BatchNorm, BNReLU, FullyConnected,
-    LinearWrap)
+    LinearWrap, MaxPooling)
 
+
+def subsample(inputs, factor, scope=None):
+    """Subsamples the input along the spatial dimensions.
+    Args:
+      inputs: A `Tensor` of size [batch, height_in, width_in, channels].
+      factor: The subsampling factor.
+      scope: Optional variable_scope.
+    Returns:
+      output: A `Tensor` of size [batch, height_out, width_out, channels] with the
+        input, either intact (if factor == 1) or subsampled (if factor > 1).
+    """
+    # import pdb
+    # pdb.set_trace()
+
+    if factor == 1:
+        return inputs
+    else:
+        # output = MaxPooling(scope_name=scope, inputs=inputs, pool_size=1, strides=factor)
+        return tf.contrib.layers.max_pool2d(inputs, [1, 1], stride=factor, scope=scope) 
 
 def resnet_shortcut(l, n_out, stride, rate, nl=tf.identity):
     data_format = get_arg_scope()['Conv2D']['data_format']
     n_in = l.get_shape().as_list()[1 if data_format == 'NCHW' else 3]
     if n_in != n_out:   # change dimension when channel is not the same
-        return Conv2D('convshortcut', l, n_out, 1, stride=stride, dilation_rate=rate, nl=nl)
+        return Conv2D('convshortcut', l, n_out, 1, stride=stride, nl=nl)
     else:
-        return l
-
+        return subsample(l, stride, 'shortcut')
 
 def apply_preactivation(l, preact):
     if preact == 'bnrelu':
@@ -85,9 +103,13 @@ def resnet_bottleneck(l, ch_out, stride, rate, stride_first=False):
     stride_first: original resnet put stride on first conv. fb.resnet.torch put stride on second conv.
     """
     shortcut = l
-    l = Conv2D('conv1', l, ch_out, 1, stride=stride if stride_first else 1, dilation_rate=1 if stride_first else rate, nl=BNReLU)
-    l = Conv2D('conv2', l, ch_out, 3, stride=1 if stride_first else stride, dilation_rate=rate if stride_first else 1, nl=BNReLU)
-    l = Conv2D('conv3', l, ch_out * 4, 1, dilation_rate=1, nl=get_bn(zero_init=True))
+    l = Conv2D('conv1', l, ch_out, 1, stride=1, dilation_rate=1, nl=BNReLU)
+    l = Conv2D('conv2', l, ch_out, 3, stride=stride, dilation_rate=rate, nl=BNReLU)
+    l = Conv2D('conv3', l, ch_out * 4, 1, stride=1, dilation_rate=1, nl=get_bn(zero_init=True))
+
+    # import pdb
+    # pdb.set_trace()
+
     return l + resnet_shortcut(shortcut, ch_out * 4, stride, rate, nl=get_bn(zero_init=False))
 
 
@@ -116,9 +138,12 @@ def resnet_group(l, name, block_func, features, count, stride, rate):
             multi_grid_rate = [1] * count
         # import pdb
         # pdb.set_trace()
-        for i in range(0, count):
+        for i in range(count):
             with tf.variable_scope('block{}'.format(i)):
-                l = block_func(l, features, stride if i == 0 else 1, multi_grid_rate[i])
+                # import pdb
+                # pdb.set_trace()
+                block_stride = stride if i == (count-1) else 1
+                l = block_func(l, features, block_stride, multi_grid_rate[i])
                 # end of each block need an activation
                 l = tf.nn.relu(l)
     return l
@@ -130,8 +155,8 @@ def resnet_backbone(image, num_blocks, group_func, block_func):
         logits = (LinearWrap(image)
                   .Conv2D('conv0', 64, 7, stride=2, nl=BNReLU)
                   .MaxPooling('pool0', shape=3, stride=2, padding='SAME')
-                  .apply(group_func, 'group0', block_func, 64, num_blocks[0], 1, 1)
+                  .apply(group_func, 'group0', block_func, 64, num_blocks[0], 2, 1)
                   .apply(group_func, 'group1', block_func, 128, num_blocks[1], 2, 1)
-                  .apply(group_func, 'group2', block_func, 256, num_blocks[2], 2, 1)
+                  .apply(group_func, 'group2', block_func, 256, num_blocks[2], 1, 1)
                   .apply(group_func, 'group3', block_func, 512, num_blocks[3], 1, 2)())
     return logits 

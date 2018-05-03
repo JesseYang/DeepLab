@@ -21,31 +21,41 @@ from tensorpack.utils.gpu import get_nr_gpu
 from tensorpack.models import (
     Conv2D, GlobalAvgPooling, BatchNorm, BNReLU, FullyConnected,
     LinearWrap)
-from resnet_model_copy import (
-    preresnet_group, preresnet_basicblock, preresnet_bottleneck,
-    resnet_group, resnet_basicblock, resnet_bottleneck, se_resnet_bottleneck,
-    resnet_backbone)
+# from resnet_model_copy import (
+#     preresnet_group, preresnet_basicblock, preresnet_bottleneck,
+#     resnet_group, resnet_basicblock, resnet_bottleneck, se_resnet_bottleneck,
+#     resnet_backbone)
 
 from cfgs.config import cfg
 from reader import Data
 
+# slim module
+from tensorflow.contrib.slim.nets import resnet_v2
+from tensorflow.contrib import layers as layers_lib
+from tensorflow.contrib.framework.python.ops import arg_scope
+from tensorflow.contrib.layers.python.layers import layers
+from tensorflow.contrib.slim.python.slim.nets import resnet_utils
+
+_BATCH_NORM_DECAY = 0.9997
+_WEIGHT_DECAY = 5e-4
+
 class DeeplabModel(ModelDesc):
     def __init__(self, data_format='NHWC', depth=101, mode='resnet'):
-        super(DeeplabModel, self).__init__()
+        # super(DeeplabModel, self).__init__()
         self.data_format = data_format
         self.mode = mode
-        basicblock = preresnet_basicblock if mode == 'preact' else resnet_basicblock
-        bottleneck = {
-            'resnet': resnet_bottleneck,
-            'preact': preresnet_bottleneck,
-            'se': se_resnet_bottleneck}[mode]
-        self.num_blocks, self.block_func = {
-            18: ([2, 2, 2, 2], basicblock),
-            34: ([3, 4, 6, 3], basicblock),
-            50: ([3, 4, 6, 3], bottleneck),
-            101: ([3, 4, 23, 3], bottleneck),
-            152: ([3, 8, 36, 3], bottleneck)
-        }[depth]
+       #  basicblock = preresnet_basicblock if mode == 'preact' else resnet_basicblock
+       #  bottleneck = {
+       #      'resnet': resnet_bottleneck,
+       #      'preact': preresnet_bottleneck,
+       #      'se': se_resnet_bottleneck}[mode]
+       #  self.num_blocks, self.block_func = {
+       #      18: ([2, 2, 2, 2], basicblock),
+       #      34: ([3, 4, 6, 3], basicblock),
+       #      50: ([3, 4, 6, 3], bottleneck),
+       #      101: ([3, 4, 23, 3], bottleneck),
+       #      152: ([3, 8, 36, 3], bottleneck)
+       #  }[depth]
 
     @staticmethod
     def image_preprocess(image, bgr=True):
@@ -65,12 +75,31 @@ class DeeplabModel(ModelDesc):
             return image
 
     def _get_inputs(self):
+#        return [InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'input'), 
+#                InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 1], 'label')
+#               ]
         return [InputDesc(tf.uint8, [None, None, None, 3], 'input'),
                 InputDesc(tf.uint8, [None, None, None, 1], 'label')]
    
     def _get_logits(self, image):
-        with argscope([Conv2D, MaxPooling, GlobalAvgPooling, BatchNorm], data_format=self.data_format):
-            return resnet_backbone(image, self.num_blocks, preresnet_group if self.mode == 'preact' else resnet_group, self.block_func)       
+#        with argscope([Conv2D, MaxPooling, GlobalAvgPooling, BatchNorm], data_format=self.data_format):
+#            return resnet_backbone(image, self.num_blocks, preresnet_group if self.mode == 'preact' else resnet_group, self.block_func)       
+
+        if self.depth == 50:
+            base_model = resnet_v2.resnet_v2_50
+        else:
+            base_model = resnet_v2.resnet_v2_101
+
+        with tf.contrib.slim.arg_scope(resnet_v2.resnet_arg_scope(batch_norm_decay=_BATCH_NORM_DECAY)):
+            logits, end_points = base_model(image,
+                                            num_classes=None,
+                                            # is_training=is_training,
+                                            global_pool=False,
+                                            output_stride=cfg.output_stride)
+
+        net = end_points[cfg.base_architecture + '/block4']
+
+        return net
  
     def _build_graph(self, inputs):
         image, label = inputs
@@ -90,22 +119,24 @@ class DeeplabModel(ModelDesc):
 
         # the backbone part
         logits = self._get_logits(image)
+        # logits_size = logits.get_shape().as_list()[1:3]
         logits_size = tf.shape(logits)[1:3]
 
         # Compute the ASPP.
-        with argscope(Conv2D, filters=256, kernel_size=3, activation=BNReLU):
-            ASPP_1 = Conv2D('aspp_conv1', logits, kernel_size=1)
-            ASPP_2 = Conv2D('aspp_conv2', logits, dilation_rate=cfg.atrous_rates[0])
-            ASPP_3 = Conv2D('aspp_conv3', logits, dilation_rate=cfg.atrous_rates[1])
-            ASPP_4 = Conv2D('aspp_conv4', logits, dilation_rate=cfg.atrous_rates[2])
-            # ImagePooling = GlobalAvgPooling('image_pooling', logits)
-            ImagePooling = tf.reduce_mean(logits, [1, 2], name='global_average_pooling', keepdims=True)
-            image_level_features = Conv2D('image_level_conv', ImagePooling, kernel_size=1)
-        image_level_features = tf.image.resize_bilinear(image_level_features, logits_size, name='upsample')
-        logits = tf.concat([ASPP_1, ASPP_2, ASPP_3, ASPP_4, image_level_features], -1, name='concat')
-        logits = Conv2D('conv_after_concat', logits, 256, 1, activation=BNReLU)
-        # logits = BatchNorm(logits)
-        logits = Conv2D('final_conv', logits, cfg.num_classes, 1)
+        with tf.variable_scope("ASPP"): #, reuse=tf.AUTO_REUSE):
+            with argscope(Conv2D, filters=256, kernel_size=3, activation=BNReLU):
+                ASPP_1 = Conv2D('aspp_conv1', logits, kernel_size=1)
+                ASPP_2 = Conv2D('aspp_conv2', logits, dilation_rate=cfg.atrous_rates[0])
+                ASPP_3 = Conv2D('aspp_conv3', logits, dilation_rate=cfg.atrous_rates[1])
+                ASPP_4 = Conv2D('aspp_conv4', logits, dilation_rate=cfg.atrous_rates[2])
+                # ImagePooling = GlobalAvgPooling('image_pooling', logits)
+                ImagePooling = tf.reduce_mean(logits, [1, 2], name='global_average_pooling', keepdims=True)
+                image_level_features = Conv2D('image_level_conv', ImagePooling, kernel_size=1)
+            image_level_features = tf.image.resize_bilinear(image_level_features, logits_size, name='upsample')
+            logits = tf.concat([ASPP_1, ASPP_2, ASPP_3, ASPP_4, image_level_features], -1, name='concat')
+            logits = Conv2D('conv_after_concat', logits, 256, 1, activation=BNReLU)
+            # logits = BatchNorm(logits)
+            logits = Conv2D('final_conv', logits, cfg.num_classes, 1)
 
         # Compute softmax cross entropy loss for logits
         logits = tf.image.resize_bilinear(logits, tf.shape(label)[1:3], align_corners=True)
@@ -131,18 +162,14 @@ class DeeplabModel(ModelDesc):
         pred_flatten = tf.reshape(pred, shape=[-1])
         label_flatten = tf.where(tf.equal(label_flatten, cfg.ignore_label), tf.zeros_like(label_flatten), label_flatten)
         label_flatten = tf.cast(label_flatten, tf.int64)
-        miou, miou_update_op = tf.metrics.mean_iou(label_flatten, pred_flatten, cfg.num_classes, weights=mask, name="metric_scope")
-        running_vars = tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope="InferenceTower/metric_scope")
-        # running_vars = tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES)
-        miou_reset_op = tf.variables_initializer(var_list=running_vars, name='miou_reset_op')
+        miou, miou_update_op = tf.metrics.mean_iou(label_flatten, pred_flatten, cfg.num_classes, weights=mask)
         miou = tf.identity(miou, name='miou')
         miou_update_op = tf.identity(miou_update_op, name='miou_update_op')
     
         add_moving_summary(loss, wd_cost, self.cost)
 
     def _get_optimizer(self):
-        # lr = get_scalar_var('learning_rate', cfg.base_lr, summary=True)
-        lr = get_scalar_var('learning_rate', 1e-3, summary=True)
+        lr = get_scalar_var('learning_rate', cfg.base_lr, summary=True)
         optimizer = tf.train.MomentumOptimizer(lr, cfg.momentum)
         
         return optimizer
@@ -150,27 +177,16 @@ class DeeplabModel(ModelDesc):
 class CalMIOU(Inferencer):
 
     def __init__(self):
-        self.cal_miou_name = 'InferenceTower/miou:0'
-        self.reset_miou_name = 'InferenceTower/miou_reset_op'
-        self.update_miou_name = 'InferenceTower/miou_update_op'
+
+        self.val_miou_name = 'InferenceTower/miou:0'
         self.names = ["miou_update_op"]
-
-    def _get_from_graph(self):
-        sess = tf.get_default_session()
-        graph = sess.graph
-        reset_miou = graph.get_operation_by_name(self.reset_miou_name)
-        update_miou = graph.get_operation_by_name(self.update_miou_name)
-        cal_miou = graph.get_tensor_by_name(self.cal_miou_name)
-        return sess, reset_miou, update_miou, cal_miou
-
-    def _before_inference(self):
-        sess, reset_miou, update_miou, cal_miou = self._get_from_graph()
-        sess.run(reset_miou)
 
     def _get_fetches(self):
         return self.names
 
     def _after_inference(self):
+        sess = tf.get_default_session()
+        graph = sess.graph
         # the following code should find the target names:
         #   ['tower0/miou', 'tower0/miou_update_op', ['tower1/miou', 'tower1/miou_update_op', ...
         #    'InferenceTower/miou', 'InferenceTower/miou_update_op']
@@ -179,9 +195,9 @@ class CalMIOU(Inferencer):
         op_names = [e.name for e in op_list]
         target_names = [e for e in op_names if "miou" in e]
         '''
-        sess, reset_miou, update_miou, cal_miou = self._get_from_graph()
-        cal_miou = sess.run(cal_miou)
-        ret = {"val_miou": cal_miou}
+        val_miou = graph.get_tensor_by_name(self.val_miou_name)
+        val_miou = sess.run(val_miou)
+        ret = {"val_miou": val_miou}
         return ret
 
 def get_data(train_or_test, batch_size):
@@ -221,14 +237,16 @@ def get_config(args, model):
     ds_train, train_sample_num = get_data('train', args.batch_size_per_gpu)
     ds_test, _ = get_data('test', 1) #args.batch_size_per_gpu)
 
+    training_number_of_steps = 300 * train_sample_num // (args.batch_size_per_gpu * get_nr_gpu())
+
     steps_per_epoch = train_sample_num // (args.batch_size_per_gpu * get_nr_gpu())
 
     epoch_num = int(cfg.max_itr_num / steps_per_epoch)
 
     callbacks = [
       ModelSaver(),
-      InferenceRunner(ds_test, CalMIOU()),
-      HyperParamSetterWithFunc('learning_rate', lambda e, x: (((cfg.base_lr - cfg.end_lr) * (1 - steps_per_epoch * e / cfg.max_itr_num) ** cfg.learning_power) + cfg.end_lr)),
+      PeriodicTrigger(InferenceRunner(ds_test, CalMIOU()), every_k_epochs=3),
+      HyperParamSetterWithFunc('learning_rate', lambda e, x: (((cfg.base_lr - cfg.end_lr) * (1 - steps_per_epoch * (e+9) / cfg.max_itr_num) ** cfg.learning_power) + cfg.end_lr)),
       HumanHyperParamSetter('learning_rate'),
     ]
 
@@ -244,7 +262,7 @@ def get_config(args, model):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.', default="1")
+    parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.', default="0")
     parser.add_argument('--batch_size_per_gpu', help='batch size per gpu', type=int, default=8)
     parser.add_argument('--load', help='load model')
     parser.add_argument('--flops', action='store_true', help='print flops and exit')
@@ -258,6 +276,10 @@ if __name__ == '__main__':
     model = DeeplabModel()
     
     if args.flops:
+#        input_desc = [
+#            InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'input'),
+#            InputDesc(tf.uint8, [None, cfg.crop_size[0], cfg.crop_size[1], 3], 'label')
+#        ]
         input_desc = [
             InputDesc(tf.uint8, [None, None, None, 3], 'input'),
             InputDesc(tf.uint8, [None, None, None, 1], 'label')

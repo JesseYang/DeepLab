@@ -16,22 +16,22 @@ import matplotlib.pyplot as plt
 import skimage.io as io
 import pylab
 
-
+from PIL import Image
+import tensorflow as tf
 
 from tensorpack.tfutils.sesscreate import SessionCreatorAdapter, NewSessionCreator
 from tensorpack import *
 
 try:
     from .cfgs.config import cfg
-    from .utils import postprocess
 except Exception:
     from cfgs.config import cfg
-    from utils import postprocess
 
 try:
     from .train import DeeplabModel
 except Exception:
     from train import DeeplabModel
+
 
 def get_pred_func(args):
     sess_init = SaverRestore(args.model_path)
@@ -39,29 +39,50 @@ def get_pred_func(args):
     predict_config = PredictConfig(session_init=sess_init,
                                    model=model,
                                    input_names=["input"],
-#                                   output_names=["loc_pred", "cls_pred"])
+                                   output_names=["predicts"])
 
     predict_func = OfflinePredictor(predict_config)
     return predict_func
 
-def draw_result(image, boxes):
-   return image_result
+# def draw_result(image, boxes):
+#    return image_result
+def decode_labels(mask, num_images=1, num_classes=21):
+    """Decode batch of segmentation masks.
+    Args:
+      mask: result of inference after taking argmax.
+      num_images: number of images to decode from the batch.
+      num_classes: number of classes to predict (including background).
+    Returns:
+      A batch with num_images RGB images of the same size as the input.
+    """
+    n, h, w, c = mask.shape
+    assert (n >= num_images), 'Batch size %d should be greater or equal than number of images to save %d.' % (n, num_images)
+    outputs = np.zeros((num_images, h, w, 3), dtype=np.uint8)
+    for i in range(num_images):
+        img = Image.new('RGB', (len(mask[i, 0]), len(mask[i])))
+        pixels = img.load()
+        for j_, j in enumerate(mask[i, :, :, 0]):
+            for k_, k in enumerate(j):
+                if k < num_classes:
+                    pixels[k_, j_] = cfg.label_colours[k]
+        outputs[i] = np.array(img)
+    return outputs
 
 def predict_image(input_path, output_path, predict_func)
     ori_image = cv2.imread(input_path)
     cvt_clr_image = cv2.cvtColor(ori_image, cv2.COLOR_BGR2RGB)
-    image = cv2.resize(cvt_clr_image, (cfg.crop_size[0], cfg.crop_size[1]))
+    # image = cv2.resize(cvt_clr_image, (cfg.crop_size[0], cfg.crop_size[1]))
     image = np.expand_dims(image, axis=0)
     predictions = predict_func(image)
 
-    image_result = draw_result(ori_image, boxes)
+    image_result = decode_labels(predictions, 1, cfg.num_classes)
     cv2.imwrite(output_path, image_result)
 
 def generate_pred_result(image_paths, predict_func, pred_dir):
 
-    for class_name in cfg.classes_name:
-        with open(os.path.join(pred_dir, class_name + ".txt"), 'w') as f:
-            continue
+#    for class_name in cfg.classes_name:
+#        with open(os.path.join(pred_dir, class_name + ".txt"), 'w') as f:
+#            continue
 
     for image_idx, image_path in enumerate(image_paths):
         if image_idx % 100 == 0 and image_idx > 0:
@@ -75,22 +96,20 @@ def generate_pred_result(image_paths, predict_func, pred_dir):
         image = np.expand_dims(image, axis=0)
         predictions = predict_func(image)
 
-        pred_results = postprocess(predictions, image_path=image_path)
+        # pred_results = decode_labels(predictions, len(image_path), cfg.num_classes)
 
-        for class_name in pred_results.keys():
-            with open(os.path.join(pred_dir, class_name + ".txt"), 'a') as f:
-                for box in pred_results[class_name]:
-                    record = [image_id]
-                    record.extend(box)
-                    record = [str(ele) for ele in record]
-                    f.write(' '.join(record) + '\n')
+        pred_results = predictions.copy() 
 
-def generate_pred_images(image_paths, predict_func, crop, generate_resultfomat, evaluate_name, output_dir, det_th, enlarge_ratio=1.3):
-    json_file = []
+        with open((pred_dir + ".txt"), 'a') as f:
+            for pred in pred_results:
+                record = [image_id]
+                record.extend(pred)
+                record = [str(ele) for ele in record]
+                f.write(record + '\n')
+
+def generate_pred_images(image_paths, predict_func, output_dir):
    
     for image_idx, image_path in enumerate(image_paths):
-        # if image_idx >= 2:
-        #     continue
 
         if not os.path.exists(image_path):
             continue
@@ -101,136 +120,36 @@ def generate_pred_images(image_paths, predict_func, crop, generate_resultfomat, 
         ori_image = cv2.imread(image_path)
 
         cvt_color_image = cv2.cvtColor(ori_image, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(cvt_color_image, (cfg.img_w, cfg.img_h))
+        # image = cv2.resize(cvt_color_image, (cfg.img_w, cfg.img_h))
         image = np.expand_dims(image, axis=0)
         predictions = predict_func(image)
 
-        boxes = postprocess(predictions, image_path=image_path, det_th=det_th)
+        image_result = decode_labels(predictions, len(image_paths), cfg.num_classes)
 
-        image_name = ntpath.basename(image_path)
-        if crop == True:
-            # crop each box and save
-            for klass, k_boxes in boxes.items():
-                for box_idx, k_box in enumerate(k_boxes):
-                    [conf, xmin, ymin, xmax, ymax] = k_box
-                    xcenter = (xmin + xmax) / 2
-                    ycenter = (ymin + ymax) / 2
-                    width = (xmax - xmin) * enlarge_ratio
-                    height = (ymax - ymin) * enlarge_ratio
-                    xmin = np.max([0, int(xcenter - width / 2)])
-                    ymin = np.max([0, int(ycenter - height / 2)])
-                    xmax = np.min([ori_image.shape[1] - 1, int(xcenter + width / 2)])
-                    ymax = np.min([ori_image.shape[0] - 1, int(ycenter + height / 2)])
-                    crop_img = ori_image[int(ymin):int(ymax),int(xmin):int(xmax)]
-
-                    name_part, img_type = image_name.split('.')
-                    save_name = name_part + "_" + klass + "_" + str(box_idx) + "." + img_type
-                    save_path = os.path.join(output_dir, save_name)
-                    if generate_resultfomat:
-                        result_dict = {}
-                        result_dict["image_id"] = int(re.sub(r"\b0*([1-9][0-9]*|0)", r"\1", img_name))
-                        result_dict["category_id"] = int(cfg.classes_label[klass])
-                        result_dict["bbox"] = [int(xmin), int(ymin), int(xmax-xmin), int(ymax-ymin)]
-                        result_dict["score"] = float(round(conf, 3))
-                        json_file.append(json.dumps(result_dict))
-
-                    else:
-                        cv2.imwrite(save_path, crop_img)
-                    
-        else:
-            # draw box on original image and save
-            image_result = draw_result(ori_image, boxes)
-            # save_path = os.path.join(output_dir, str(uuid.uuid4()) + ".jpg")
-            save_path = os.path.join(output_dir, image_path.split('/')[-1])
-            # cv2.imwrite(save_path, image_result)
-            cv2.imwrite(save_path, image_result)
-
-    if generate_resultfomat:
-        save_json = open(evaluate_name, 'w')
-        save_json.write("[")
-        for idx, i in enumerate(json_file):
-            
-            save_json.write(i)
-
-            if idx == (len(json_file)-1):
-                save_json.write("]")
-            else:
-                save_json.write(",")
-        save_json.close()
-        
-
-def evaluate_map(annotations, evaluate_name):
-
-    print("strat evaluate......")
-    pylab.rcParams['figure.figsize'] = (10.0, 8.0)
-    annType = ['segm','bbox','keypoints']
-    annType = annType[1]      #specify type here
-    prefix = 'person_keypoints' if annType=='keypoints' else 'instances'
-    # print (annType)
-    
-    #initialize COCO ground truth api
-    # dataDir="/home/user/Datasets/coco"
-    # dataType='val2017'
-    # annFile = '%s/annotations/%s_%s.json'%(dataDir,prefix,dataType)
-    # annFile = annotations
-    # print(annFile)
-    print(annotations)
-    cocoGt=COCO(annotations)
-
-    #initialize COCO detections api
-    # resFile='%s/%s_%s_fake%s100_results.json'
-    # resFile = resFile%(dataDir, prefix, dataType, annType)
-    resFile = os.path.join('/home/user/yzx/SSD',evaluate_name)
-    
-    if not os.path.exists(resFile):
-        print(resFile,"not exists")
-        quit()
-    print(resFile)
-    cocoDt=cocoGt.loadRes(resFile)
-
-    imgIds=sorted(cocoGt.getImgIds())
-    imgIds=imgIds[0:100]
-    imgId = imgIds[np.random.randint(100)]
-
-    # running evaluation
-    cocoEval = COCOeval(cocoGt,cocoDt,annType)
-    cocoEval.params.imgIds  = imgIds
-    cocoEval.evaluate()
-    cocoEval.accumulate()
-    cocoEval.summarize()
-
+        save_path = os.path.join(output_dir, image_path.split('/')[-1])
+        # cv2.imwrite(save_path, image_result)
+        cv2.imwrite(save_path, image_result)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--backbone', help='the backbone network', default='mobilenetv2')
+    # parser.add_argument('--backbone', help='the backbone network', default='mobilenetv2')
     parser.add_argument('--model_path', help='path of the model waiting for validation.')
     parser.add_argument('--data_format', choices=['NCHW', 'NHWC'], default='NHWC')
     parser.add_argument('--input_path', help='path of the input image')
-    parser.add_argument('--output_path', help='path of the output image', default='output.png')
-    parser.add_argument('--test_path', help='path of the test file', default=None)
-    parser.add_argument('--pred_dir', help='directory to save txt result', default='result_pred')
-    parser.add_argument('--det_th', help='detection threshold', type=float, default=0.01)
-    parser.add_argument('--gen_image', action='store_true')
-    parser.add_argument('--crop', action='store_true')
+    parser.add_argument('--output_path', help='path of the predictive output image', default='output.png')
+    parser.add_argument('--test_dir', help='directory of the test file', default=None)
     parser.add_argument('--output_dir', help='directory to save image result', default='output')
-
-    ##evaluate parameter
-    parser.add_argument('--generate_resultfomat', help='if generate json file for coco map compute', action='store_true')
-    parser.add_argument('--evaluate_name', help='the evaluate result .json file name', default='train2017_result.json')
-    parser.add_argument('--annotations_path', help='path of annotations json file', default='coco/annotations/instances_train2017.json')
-    parser.add_argument('--map_evaluate', action='store_true')
+    parser.add_argument('--pred_txt_dir', help='directory to save txt result', default='result_pred')
+    parser.add_argument('--gen_image', action='store_true')
 
     args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = "0"
-    if args.map_evaluate:
-        evaluate_map(args.annotations_path, args.evaluate_name)
-        quit()
 
     predict_func = get_pred_func(args)
     
-    new_dir = args.output_dir if args.gen_image else args.pred_dir
+    new_dir = args.output_dir if args.gen_image else args.pred_txt_dir
 
     if os.path.isdir(new_dir):
         shutil.rmtree(new_dir)
@@ -238,9 +157,9 @@ if __name__ == '__main__':
 
     if args.input_path != None:
         # predict one image (given the input image path) and save the result image
-        predict_image(args.input_path, args.output_path, predict_func, float(args.det_th))
-    elif args.test_path != None:
-        test_paths = args.test_path.split(',')
+        predict_image(args.input_path, args.output_path, predict_func) 
+    elif args.test_dir != None:
+        test_paths = args.test_dir.split(',')
         image_paths = []
         for test_path in test_paths:
             with open(test_path) as f:
@@ -250,7 +169,7 @@ if __name__ == '__main__':
         print("Number of images to predict: " + str(len(image_paths)))
         if args.gen_image:
             # given the txt file, predict the images and save the images result
-            generate_pred_images(image_paths, predict_func, args.crop, args.generate_resultfomat, args.evaluate_name, args.output_dir, float(args.det_th))
+            generate_pred_images(image_paths, predict_func, args.output_dir)
         else:
             # given the txt file, predict the images and save the txt result
-            generate_pred_result(image_paths, predict_func, args.pred_dir)
+            generate_pred_result(image_paths, predict_func, args.pred_txt_dir)

@@ -13,10 +13,17 @@ import tensorflow as tf
 from tensorflow.contrib.layers import variance_scaling_initializer
 from tensorflow.contrib.framework.python.ops import variables
 from tensorflow.python.ops import init_ops
+from tensorflow.contrib.slim.nets import resnet_v2
+from tensorflow.contrib import layers as layers_lib
+from tensorflow.contrib.framework.python.ops import arg_scope
+from tensorflow.contrib.layers.python.layers import layers
+from tensorflow.contrib.slim.python.slim.nets import resnet_utils
+
 from tensorpack import *
 from tensorpack.tfutils.symbolic_functions import *
 from tensorpack.tfutils.common import get_tf_version_number
 from tensorpack.tfutils.summary import *
+from tensorpack.tfutils.tower import get_current_tower_context
 from tensorpack.utils.gpu import get_nr_gpu
 from tensorpack.models import (
     Conv2D, GlobalAvgPooling, BatchNorm, BNReLU, FullyConnected,
@@ -64,6 +71,19 @@ class DeeplabModel(ModelDesc):
             image = (image - image_mean) / image_std
             return image
 
+    @staticmethod
+    def image_preprocess_slim(image, bgr=True):
+        with tf.name_scope('image_preprocess'):
+            if image.dtype.base_dtype != tf.float32:
+                image = tf.cast(image, tf.float32)
+
+            mean = [123.68, 116.78, 103.94] # rgb
+            if bgr:
+                mean = mean[::-1]
+            image_mean = tf.constant(mean, dtype=tf.float32)
+            image = image - image_mean
+            return image
+
     def _get_inputs(self):
         return [InputDesc(tf.uint8, [None, None, None, 3], 'input'),
                 InputDesc(tf.uint8, [None, None, None, 1], 'label')]
@@ -71,27 +91,77 @@ class DeeplabModel(ModelDesc):
     def _get_logits(self, image):
         with argscope([Conv2D, MaxPooling, GlobalAvgPooling, BatchNorm], data_format=self.data_format):
             return resnet_backbone(image, self.num_blocks, preresnet_group if self.mode == 'preact' else resnet_group, self.block_func)       
+
+    def _get_logits_by_slim_model(self, inputs):
+        ctx = get_current_tower_context()
+        with tf.contrib.slim.arg_scope(resnet_v2.resnet_arg_scope(batch_norm_decay=0.9997)):
+            logits, end_points = resnet_v2.resnet_v2_101(inputs,
+                                                         num_classes=None,
+                                                         is_training=ctx.is_training,
+                                                         global_pool=False,
+                                                         output_stride=16)
+        net = end_points['resnet_v2_101/block4']
+        return net
  
     def _build_graph(self, inputs):
         image, label = inputs
         self.batch_size = tf.shape(image)[0]
         org_label = label
         # when show image summary, first convert to RGB format
-        image_rgb = tf.reverse(image, axis=[-1])
+        image = tf.reverse(image, axis=[-1])
         label_shown = tf.where(tf.equal(label, cfg.ignore_label), tf.zeros_like(label), label)
         label_shown = tf.cast(label_shown * 10, tf.uint8) 
-        tf.summary.image('input-image', image_rgb, max_outputs=3)
+        tf.summary.image('input-image', image, max_outputs=3)
         tf.summary.image('input-label', label_shown, max_outputs=3)
 
-        image = DeeplabModel.image_preprocess(image, bgr=True)
+        # image = DeeplabModel.image_preprocess(image, bgr=True)
+        image = DeeplabModel.image_preprocess_slim(image, bgr=False)
 
         if self.data_format == "NCHW":
             image = tf.transpose(image, [0, 3, 1, 2])
 
         # the backbone part
-        logits = self._get_logits(image)
+        # logits = self._get_logits(image)
+        logits = self._get_logits_by_slim_model(image)
         logits_size = tf.shape(logits)[1:3]
 
+
+        ctx = get_current_tower_context()
+        with tf.variable_scope("aspp"):
+            inputs = logits
+            depth = 256
+            output_stride = 16
+            atrous_rates = [6, 12, 18]
+        
+            with tf.contrib.slim.arg_scope(resnet_v2.resnet_arg_scope(batch_norm_decay=0.9997)):
+                with arg_scope([layers.batch_norm], is_training=ctx.is_training):
+                    inputs_size = tf.shape(inputs)[1:3]
+                    # (a) one 1×1 convolution and three 3×3 convolutions with rates = (6, 12, 18) when output stride = 16.
+                    # the rates are doubled when output stride = 8.
+                    conv_1x1 = layers_lib.conv2d(inputs, depth, [1, 1], stride=1, scope="conv_1x1")
+                    conv_3x3_1 = resnet_utils.conv2d_same(inputs, depth, 3, stride=1, rate=atrous_rates[0], scope='conv_3x3_1')
+                    conv_3x3_2 = resnet_utils.conv2d_same(inputs, depth, 3, stride=1, rate=atrous_rates[1], scope='conv_3x3_2')
+                    conv_3x3_3 = resnet_utils.conv2d_same(inputs, depth, 3, stride=1, rate=atrous_rates[2], scope='conv_3x3_3')
+        
+                    # (b) the image-level features
+                    with tf.variable_scope("image_level_features"):
+                        # global average pooling
+                        image_level_features = tf.reduce_mean(inputs, [1, 2], name='global_average_pooling', keepdims=True)
+                        # 1×1 convolution with 256 filters( and batch normalization)
+                        image_level_features = layers_lib.conv2d(image_level_features, depth, [1, 1], stride=1, scope='conv_1x1')
+                        # bilinearly upsample features
+                        image_level_features = tf.image.resize_bilinear(image_level_features, inputs_size, name='upsample')
+        
+                    net = tf.concat([conv_1x1, conv_3x3_1, conv_3x3_2, conv_3x3_3, image_level_features], axis=3, name='concat')
+                    net = layers_lib.conv2d(net, depth, [1, 1], stride=1, scope='conv_1x1_concat')
+    
+    
+        with tf.variable_scope("upsampling_logits"):
+            net = layers_lib.conv2d(net, cfg.num_classes, [1, 1], activation_fn=None, normalizer_fn=None, scope='conv_1x1')
+            logits = tf.image.resize_bilinear(net, tf.shape(label)[1:3], name='upsample')
+
+
+        '''
         # Compute the ASPP.
         with argscope(Conv2D, filters=256, kernel_size=3, activation=BNReLU):
             ASPP_1 = Conv2D('aspp_conv1', logits, kernel_size=1)
@@ -109,13 +179,17 @@ class DeeplabModel(ModelDesc):
 
         # Compute softmax cross entropy loss for logits
         logits = tf.image.resize_bilinear(logits, tf.shape(label)[1:3], align_corners=True)
+        '''
+
         label_flatten = tf.reshape(label, shape=[-1])
         mask = tf.to_float(tf.not_equal(label_flatten, cfg.ignore_label)) * 1.0
         one_hot_label = tf.one_hot(label_flatten, cfg.num_classes, on_value=1.0, off_value=0.0)
 
         loss = tf.losses.softmax_cross_entropy(one_hot_label, tf.reshape(logits, shape=[-1, cfg.num_classes]), weights=mask)
         if cfg.weight_decay > 0:
-            wd_cost = regularize_cost('.*/W', l2_regularizer(cfg.weight_decay), name='l2_regularize_loss')
+            # wd_cost = regularize_cost('.*/W', l2_regularizer(cfg.weight_decay), name='l2_regularize_loss')
+            train_var_list = [v for v in tf.trainable_variables()]
+            wd_cost = cfg.weight_decay * tf.add_n([tf.nn.l2_loss(v) for v in train_var_list])
         else:
             wd_cost = tf.constant(0.0)
 
@@ -141,8 +215,7 @@ class DeeplabModel(ModelDesc):
         add_moving_summary(loss, wd_cost, self.cost)
 
     def _get_optimizer(self):
-        # lr = get_scalar_var('learning_rate', cfg.base_lr, summary=True)
-        lr = get_scalar_var('learning_rate', 1e-3, summary=True)
+        lr = get_scalar_var('learning_rate', cfg.base_lr, summary=True)
         optimizer = tf.train.MomentumOptimizer(lr, cfg.momentum)
         
         return optimizer
@@ -220,6 +293,8 @@ def get_config(args, model):
 
     ds_train, train_sample_num = get_data('train', args.batch_size_per_gpu)
     ds_test, _ = get_data('test', 1) #args.batch_size_per_gpu)
+
+    training_number_of_steps = 300 * train_sample_num // (args.batch_size_per_gpu * get_nr_gpu())
 
     steps_per_epoch = train_sample_num // (args.batch_size_per_gpu * get_nr_gpu())
 

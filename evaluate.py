@@ -17,8 +17,8 @@ from tensorpack import *
 from tensorpack.utils import logger
 
 from cfgs.config import cfg
-# from train_slim import DeeplabModel
-from train import DeeplabModel
+from train_slim import DeeplabModel
+# from train import DeeplabModel
 
 def get_pred_func(args):
     sess_init = SaverRestore(args.model_path)
