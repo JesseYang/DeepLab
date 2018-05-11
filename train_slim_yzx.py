@@ -28,7 +28,7 @@ from tensorpack.utils.gpu import get_nr_gpu
 from tensorpack.models import (
     Conv2D, GlobalAvgPooling, BatchNorm, BNReLU, FullyConnected,
     LinearWrap)
-from resnet_model_copy import (
+from resnet_model import (
     preresnet_group, preresnet_basicblock, preresnet_bottleneck,
     resnet_group, resnet_basicblock, resnet_bottleneck, se_resnet_bottleneck,
     resnet_backbone)

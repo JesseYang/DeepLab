@@ -22,6 +22,7 @@ import tensorflow as tf
 from tensorpack.tfutils.sesscreate import SessionCreatorAdapter, NewSessionCreator
 from tensorpack import *
 
+from preprocess_utils_clean import *
 try:
     from .cfgs.config import cfg
 except Exception:
@@ -46,7 +47,7 @@ def get_pred_func(args):
 
 # def draw_result(image, boxes):
 #    return image_result
-def decode_labels(mask, num_images=1, num_classes=21):
+def decode_labels(mask, num_classes=21):
     """Decode batch of segmentation masks.
     Args:
       mask: result of inference after taking argmax.
@@ -55,59 +56,35 @@ def decode_labels(mask, num_images=1, num_classes=21):
     Returns:
       A batch with num_images RGB images of the same size as the input.
     """
-    n, h, w, c = mask.shape
-    assert (n >= num_images), 'Batch size %d should be greater or equal than number of images to save %d.' % (n, num_images)
-    outputs = np.zeros((num_images, h, w, 3), dtype=np.uint8)
-    for i in range(num_images):
-        img = Image.new('RGB', (len(mask[i, 0]), len(mask[i])))
-        pixels = img.load()
-        for j_, j in enumerate(mask[i, :, :, 0]):
-            for k_, k in enumerate(j):
-                if k < num_classes:
-                    pixels[k_, j_] = cfg.label_colours[k]
-        outputs[i] = np.array(img)
+    mask = mask[0]
+    n, h, w = mask.shape
+    outputs = np.zeros((h, w, 3), dtype=np.uint8)
+    img = Image.new('RGB', (w, h))
+    pixels = img.load()
+    for j_, j in enumerate(mask[0, :, :]):
+        for k_, k in enumerate(j):
+            if k < num_classes:
+                pixels[k_, j_] = cfg.label_colours[k]
+    outputs = np.array(img)
     return outputs
 
-def predict_image(input_path, output_path, predict_func)
-    ori_image = cv2.imread(input_path)
-    cvt_clr_image = cv2.cvtColor(ori_image, cv2.COLOR_BGR2RGB)
+def predict_image(input_path, output_path, predict_func, args):
+    image = cv2.imread(input_path)
     # image = cv2.resize(cvt_clr_image, (cfg.crop_size[0], cfg.crop_size[1]))
-    image = np.expand_dims(image, axis=0)
-    predictions = predict_func(image)
+    if args.multi_scale_input:
+        scale = get_random_scale(cfg.min_scale_factor, cfg.max_scale_factor, 0)
+        image, _ = randomly_scale_image_and_label(image, scale=scale)
+    if args.flip:
+        image, _ = flip_dim(image) 
+    image = np.expand_dims(ori_image, axis=0)
+    prediction = predict_func(image)
 
-    image_result = decode_labels(predictions, 1, cfg.num_classes)
-    cv2.imwrite(output_path, image_result)
+    image_result = decode_labels(prediction, cfg.num_classes)
+    save_image = cv2.cvtColor(image_result, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(output_path, save_image)
 
-def generate_pred_result(image_paths, predict_func, pred_dir):
 
-#    for class_name in cfg.classes_name:
-#        with open(os.path.join(pred_dir, class_name + ".txt"), 'w') as f:
-#            continue
-
-    for image_idx, image_path in enumerate(image_paths):
-        if image_idx % 100 == 0 and image_idx > 0:
-            print(str(image_idx))
-        
-        image_id = os.path.basename(image_path).split('.')[0]
-
-        ori_image = cv2.imread(image_path)
-        ori_image = cv2.cvtColor(ori_image, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(ori_image, (cfg.img_w, cfg.img_h))
-        image = np.expand_dims(image, axis=0)
-        predictions = predict_func(image)
-
-        # pred_results = decode_labels(predictions, len(image_path), cfg.num_classes)
-
-        pred_results = predictions.copy() 
-
-        with open((pred_dir + ".txt"), 'a') as f:
-            for pred in pred_results:
-                record = [image_id]
-                record.extend(pred)
-                record = [str(ele) for ele in record]
-                f.write(record + '\n')
-
-def generate_pred_images(image_paths, predict_func, output_dir):
+def generate_pred_images(image_paths, predict_func, output_dir, args):
    
     for image_idx, image_path in enumerate(image_paths):
 
@@ -117,18 +94,22 @@ def generate_pred_images(image_paths, predict_func, output_dir):
             print(str(image_idx))
         # print(image_path)
         img_name = image_path.split('/')[-1].split('.')[0]
-        ori_image = cv2.imread(image_path)
+        image = cv2.imread(image_path)
 
-        cvt_color_image = cv2.cvtColor(ori_image, cv2.COLOR_BGR2RGB)
         # image = cv2.resize(cvt_color_image, (cfg.img_w, cfg.img_h))
+        if args.multi_scale_input:
+            scale = get_random_scale(cfg.min_scale_factor, cfg.max_scale_factor, 0)
+            image, _ = randomly_scale_image_and_label(image, scale=scale)
+        if args.flip:
+            image, _ = flip_dim(image) 
         image = np.expand_dims(image, axis=0)
-        predictions = predict_func(image)
+        prediction = predict_func(image)
 
-        image_result = decode_labels(predictions, len(image_paths), cfg.num_classes)
+        image_result = decode_labels(prediction, cfg.num_classes)
 
         save_path = os.path.join(output_dir, image_path.split('/')[-1])
-        # cv2.imwrite(save_path, image_result)
-        cv2.imwrite(save_path, image_result)
+        save_image = cv2.cvtColor(image_result, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(save_path, save_image)
 
 
 if __name__ == '__main__':
@@ -138,10 +119,12 @@ if __name__ == '__main__':
     parser.add_argument('--data_format', choices=['NCHW', 'NHWC'], default='NHWC')
     parser.add_argument('--input_path', help='path of the input image')
     parser.add_argument('--output_path', help='path of the predictive output image', default='output.png')
-    parser.add_argument('--test_dir', help='directory of the test file', default=None)
+    parser.add_argument('--test_list', help='list of the test files', default=None)
     parser.add_argument('--output_dir', help='directory to save image result', default='output')
-    parser.add_argument('--pred_txt_dir', help='directory to save txt result', default='result_pred')
-    parser.add_argument('--gen_image', action='store_true')
+    # parser.add_argument('--pred_txt_dir', help='directory to save txt result', default='result_pred')
+    # parser.add_argument('--gen_image', action='store_true')
+    parser.add_argument('--multi_scale_input', help='whether scale input images', default=False)
+    parser.add_argument('--flip', help='whether flip input images', default=False)
 
     args = parser.parse_args()
 
@@ -149,7 +132,7 @@ if __name__ == '__main__':
 
     predict_func = get_pred_func(args)
     
-    new_dir = args.output_dir if args.gen_image else args.pred_txt_dir
+    new_dir = args.output_dir # if args.gen_image else args.pred_txt_dir
 
     if os.path.isdir(new_dir):
         shutil.rmtree(new_dir)
@@ -157,9 +140,9 @@ if __name__ == '__main__':
 
     if args.input_path != None:
         # predict one image (given the input image path) and save the result image
-        predict_image(args.input_path, args.output_path, predict_func) 
-    elif args.test_dir != None:
-        test_paths = args.test_dir.split(',')
+        predict_image(args.input_path, args.output_path, predict_func, args) 
+    elif args.test_list != None:
+        test_paths = args.test_list.split(',')
         image_paths = []
         for test_path in test_paths:
             with open(test_path) as f:
@@ -167,9 +150,4 @@ if __name__ == '__main__':
             image_paths.extend([line.split(' ')[0].strip() for line in content])
                 
         print("Number of images to predict: " + str(len(image_paths)))
-        if args.gen_image:
-            # given the txt file, predict the images and save the images result
-            generate_pred_images(image_paths, predict_func, args.output_dir)
-        else:
-            # given the txt file, predict the images and save the txt result
-            generate_pred_result(image_paths, predict_func, args.pred_txt_dir)
+        generate_pred_images(image_paths, predict_func, args.output_dir, args)

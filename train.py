@@ -21,7 +21,7 @@ from tensorpack.utils.gpu import get_nr_gpu
 from tensorpack.models import (
     Conv2D, GlobalAvgPooling, BatchNorm, BNReLU, FullyConnected,
     LinearWrap)
-from resnet_model_copy import (
+from resnet_model import (
     preresnet_group, preresnet_basicblock, preresnet_bottleneck,
     resnet_group, resnet_basicblock, resnet_bottleneck, se_resnet_bottleneck,
     resnet_backbone)
@@ -74,8 +74,8 @@ class DeeplabModel(ModelDesc):
  
     def _build_graph(self, inputs):
         image, label = inputs
+        image_size = tf.shape(image)[1:3]
         self.batch_size = tf.shape(image)[0]
-        org_label = label
         # when show image summary, first convert to RGB format
         image_rgb = tf.reverse(image, axis=[-1])
         label_shown = tf.where(tf.equal(label, cfg.ignore_label), tf.zeros_like(label), label)
@@ -89,7 +89,7 @@ class DeeplabModel(ModelDesc):
             image = tf.transpose(image, [0, 3, 1, 2])
 
         # the backbone part
-        logits = self._get_logits(image)
+        logits, _ = self._get_logits(image)
         logits_size = tf.shape(logits)[1:3]
 
         # Compute the ASPP.
@@ -101,6 +101,7 @@ class DeeplabModel(ModelDesc):
             # ImagePooling = GlobalAvgPooling('image_pooling', logits)
             ImagePooling = tf.reduce_mean(logits, [1, 2], name='global_average_pooling', keepdims=True)
             image_level_features = Conv2D('image_level_conv', ImagePooling, kernel_size=1)
+
         image_level_features = tf.image.resize_bilinear(image_level_features, logits_size, name='upsample')
         logits = tf.concat([ASPP_1, ASPP_2, ASPP_3, ASPP_4, image_level_features], -1, name='concat')
         logits = Conv2D('conv_after_concat', logits, 256, 1, activation=BNReLU)
@@ -108,7 +109,7 @@ class DeeplabModel(ModelDesc):
         logits = Conv2D('final_conv', logits, cfg.num_classes, 1)
 
         # Compute softmax cross entropy loss for logits
-        logits = tf.image.resize_bilinear(logits, tf.shape(label)[1:3], align_corners=True)
+        logits = tf.image.resize_bilinear(logits, image_size, align_corners=True)
         label_flatten = tf.reshape(label, shape=[-1])
         mask = tf.to_float(tf.not_equal(label_flatten, cfg.ignore_label)) * 1.0
         one_hot_label = tf.one_hot(label_flatten, cfg.num_classes, on_value=1.0, off_value=0.0)

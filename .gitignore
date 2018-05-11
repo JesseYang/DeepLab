@@ -8,3 +8,6 @@ inception-v3
 .ipynb_checkpoints
 SBD
 useless
+cityscapes
+output*
+

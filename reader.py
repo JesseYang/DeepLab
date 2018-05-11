@@ -76,30 +76,8 @@ class Data(RNGDataFlow):
             cv2.imwrite(os.path.join(SAVE_DIR, 'image_%d.jpg' % idx), image)
             cv2.imwrite(os.path.join(SAVE_DIR, 'label_%d.jpg' % idx), label)
         if self.test_set:
-            # image_height = image.shape[0]
-            # image_width = image.shape[1]
-            # target_height = max(cfg.crop_size[0], image_height)
-            # target_width = max(cfg.crop_size[1], image_width)
-            # top = 0 # int(max(target_height - image_height, 0)/2)
-            # bottom = max(target_height - image_height - top, 0)
-            # left = 0 # int(max(target_width - image_width, 0)/2)
-            # right = max(target_width - image_width - left, 0)
-            # # Pad image to crop_size with mean pixel value.
-
-            # image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT)
-
-            # if label is not None:
-            #     label = cv2.copyMakeBorder(label, top, bottom, left, right, cv2.BORDER_CONSTANT, value=cfg.ignore_label)
-
-            # image, label = random_crop(image, label, target_height, target_width)
-            # image = np.expand_dims(image, axis=0)
-            label = np.expand_dims(label, axis=-1)
-            # label = np.expand_dims(label, axis=0)
-
-            # cv2.imwrite(os.path.join(SAVE_DIR, "%d_image_aug.jpg" % idx), image)
-            # cv2.imwrite(os.path.join(SAVE_DIR, "%d_label_aug.jpg" % idx), label)
-
-            return [image.astype(np.float32), label.astype(np.float32)]
+           label = np.expand_dims(label, axis=-1)
+           return [image.astype(np.float32), label.astype(np.float32)]
  
         if self.random_crop:
             scale = get_random_scale(cfg.min_scale_factor, cfg.max_scale_factor, 0)
@@ -110,20 +88,17 @@ class Data(RNGDataFlow):
             image_height = image_shape[0]
             image_width = image_shape[1]
 
-            target_height = image_height + max(cfg.crop_size[0] - image_height, 0)
-            target_width = image_width + max(cfg.crop_size[1] - image_width, 0)
+            target_height = max(cfg.crop_size[0], image_height)
+            target_width = max(cfg.crop_size[1], image_width)
 
             # Pad image with mean pixel value.
-            mean_pixel = np.reshape(cfg.mean_pixel, [1, 1, 3])
             image = pad_to_bounding_box(image, 0, 0, target_height, target_width, 0)
 
-            if label is not None:
-                label = pad_to_bounding_box(
+            label = pad_to_bounding_box(
                     label, 0, 0, target_height, target_width, cfg.ignore_label)
 
             # Randomly crop the image and label.
-            if label is not None:
-                image, label = random_crop(
+            image, label = random_crop(
                     image, label, cfg.crop_size[0], cfg.crop_size[1])
 
         if self.flip:
@@ -154,8 +129,8 @@ class Data(RNGDataFlow):
         super(Data, self).reset_state()
 
 if __name__ == '__main__':
-    ds = Data('voc_val.txt', shuffle=False, flip=False, random_crop=False, test_set=True, save_img=True)
-    # ds = Data('voc_train_sbd_aug.txt', shuffle=False, flip=False, random_crop=False, save_img=True)
+    # ds = Data('voc_val.txt', shuffle=False, flip=False, random_crop=False, test_set=True, save_img=True)
+    ds = Data('voc_train_sbd_aug.txt', shuffle=False, flip=True, random_crop=True, save_img=True)
 
     augmentors = [
         imgaug.RandomOrderAug(
@@ -173,7 +148,7 @@ if __name__ == '__main__':
                              )]),
     ]
 
-    ds = AugmentImageComponent(ds, augmentors)
+    # ds = AugmentImageComponent(ds, augmentors)
     ds.reset_state()
 
     g = ds.get_data()

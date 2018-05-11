@@ -19,15 +19,11 @@ import cv2
 import numpy as np
 
 
-def flip_dim(image, label, prob=0.5, dim=1):
+def flip_dim(image, label=None, prob=0.5, dim=1):
   """Randomly flips a dimension of the given tensor.
 
   The decision to randomly flip the `Tensors` is made together. In other words,
   all or none of the images pass in are flipped.
-
-  Note that tf.random_flip_left_right and tf.random_flip_up_down isn't used so
-  that we can control for the probability as well as ensure the same decision
-  is applied across the images.
 
   Args:
     tensor_list: A list of `Tensors` with the same number of dimensions.
@@ -53,7 +49,10 @@ def flip_dim(image, label, prob=0.5, dim=1):
 
   is_flipped = random_value <= prob
   out_img = flip(image) if is_flipped else image
-  out_label = flip(label) if is_flipped else label
+  if is_flipped and (label is not None):
+    out_label = flip(label)
+  else:
+    out_label = label
 
   return out_img, out_label
 
@@ -61,10 +60,6 @@ def flip_dim(image, label, prob=0.5, dim=1):
 def pad_to_bounding_box(image, offset_height, offset_width, target_height,
                         target_width, pad_value):
   """Pads the given image with the given pad_value.
-
-  Works like tf.image.pad_to_bounding_box, except it can pad the image
-  with any given arbitrary pad value and also handle images whose sizes are not
-  known during graph construction.
 
   Args:
     image: 3-D tensor with shape [height, width, channels]
@@ -83,7 +78,6 @@ def pad_to_bounding_box(image, offset_height, offset_width, target_height,
   """
   if len(image.shape) != 3 and len(image.shape) != 2:
       raise ValueError('Wrong image rank')
-  image = image.astype(np.int) -  pad_value
   height, width = image.shape[0:2]
   if target_width < width:
       raise ValueError('target_width must be >= width')
@@ -94,16 +88,13 @@ def pad_to_bounding_box(image, offset_height, offset_width, target_height,
   if after_padding_height < 0 or after_padding_width < 0:
       raise ValueError('target size not possible with the given target offsets')
 
-  padded = cv2.copyMakeBorder(image, offset_height, after_padding_height, offset_width, after_padding_width,cv2.BORDER_CONSTANT)
+  padded = cv2.copyMakeBorder(image, offset_height, after_padding_height, offset_width, after_padding_width,cv2.BORDER_CONSTANT, value=pad_value)
 
-  return (padded + pad_value).astype(np.uint8)
+  return padded
 
 
 def _crop(image, offset_height, offset_width, crop_height, crop_width):
   """Crops the given image using the provided offsets and sizes.
-
-  Note that the method doesn't assume we know the input image size but it does
-  assume we know the input image rank.
 
   Args:
     image: an image of shape [height, width, channels].
@@ -134,15 +125,10 @@ def _crop(image, offset_height, offset_width, crop_height, crop_width):
 def random_crop(image, label, crop_height, crop_width):
   """Crops the given list of images.
 
-  The function applies the same crop to each image in the list. This can be
-  effectively applied when there are multiple image inputs of the same
-  dimension such as:
-
-    image, depths, normals = random_crop([image, depths, normals], 120, 150)
+  The function applies the same crop to each image and label.
 
   Args:
-    image_list: a list of image tensors of the same dimension but possibly
-      varying channel.
+    image, label: input image and label to be cropped
     crop_height: the new height.
     crop_width: the new width.
 
@@ -150,7 +136,7 @@ def random_crop(image, label, crop_height, crop_width):
     the image_list with cropped images.
 
   Raises:
-    ValueError: if there are multiple image inputs provided with different size
+    ValueError: if the image rank isn't 3 or 2
       or the images are smaller than the crop dimensions.
   """
 
@@ -162,19 +148,17 @@ def random_crop(image, label, crop_height, crop_width):
   if image_height < crop_height or image_width < crop_width:
       raise ValueError('Crop size greater than the image size.')
 
-
-  # Create a random bounding box.
-  #
-  # Use tf.random_uniform and not numpy.random.rand as doing the former would
-  # generate random numbers at graph eval time, unlike the latter which
-  # generates random numbers at graph definition time.
   max_offset_height = image_height - crop_height
   max_offset_width = image_width - crop_width
   offset_height = np.random.random_integers(0, max_offset_height)
   offset_width = np.random.random_integers(0, max_offset_width)
 
-  return _crop(image, offset_height, offset_width,crop_height, crop_width), _crop(label, offset_height, offset_width,crop_height, crop_width)
-
+  cropped_image = _crop(image, offset_height, offset_width,crop_height, crop_width)
+  if label is not None:
+    cropped_label = _crop(label, offset_height, offset_width,crop_height, crop_width)
+  else:
+    cropped_label = label
+  return cropped_image, cropped_label
 
 def get_random_scale(min_scale_factor, max_scale_factor, step_size):
   """Gets a random scale value.
@@ -222,7 +206,9 @@ def randomly_scale_image_and_label(image, label=None, scale=1.0):
   if scale == 1.0:
     return image, label
   image_shape = image.shape
-  new_dim = tuple([int(e * scale) for e in image_shape[0:2]])
+  scale_shape = [int(e * scale) for e in image_shape[0:2]]
+  scale_shape.reverse()
+  new_dim = tuple(scale_shape)
 
   # Need squeeze and expand_dims because image interpolation takes
   # 4D tensors as input.
@@ -231,35 +217,6 @@ def randomly_scale_image_and_label(image, label=None, scale=1.0):
     label = cv2.resize(label, new_dim, interpolation=cv2.INTER_NEAREST)
 
   return image, label
-
-
-'''def resolve_shape(tensor, rank=None, scope=None):
-  """Fully resolves the shape of a Tensor.
-
-  Use as much as possible the shape components already known during graph
-  creation and resolve the remaining ones during runtime.
-
-  Args:
-    tensor: Input tensor whose shape we query.
-    rank: The rank of the tensor, provided that we know it.
-    scope: Optional name scope.
-
-  Returns:
-    shape: The full shape of the tensor.
-  """
-  with tf.name_scope(scope, 'resolve_shape', [tensor]):
-    if rank is not None:
-      shape = tensor.get_shape().with_rank(rank).as_list()
-    else:
-      shape = tensor.get_shape().as_list()
-
-    if None in shape:
-      shape_dynamic = tf.shape(tensor)
-      for i in range(len(shape)):
-        if shape[i] is None:
-          shape[i] = shape_dynamic[i]
-
-    return shape'''
 
 
 def resize_to_range(image,
