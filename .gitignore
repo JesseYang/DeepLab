@@ -10,4 +10,4 @@ SBD
 useless
 cityscapes
 output*
-
+*.ckpt
